@@ -63,7 +63,7 @@ class IncludeAnalyzer:
             dirs[:] = [
                 directory
                 for directory in dirs
-                if directory not in {".git", "__pycache__", "build", "bin", "obj", ".vscode", ".idea"}
+                if directory not in {".git", "__pycache__", "build", "bin", "obj", ".vscode", ".idea", ".scu"}
             ]
 
             for file_name in files:
@@ -689,61 +689,13 @@ class IncludeAnalyzer:
         results.sort(key=sort_key)
         return results[:top_n], header_count, workers
 
-    def _collect_direct_gateways(
-        self,
-        file_path: Path,
-        lookup: Dict[Path, Set[Path]],
-        transitive_cache: Dict[Path, Set[Path]],
-        target: Path,
-        direct_includers: Set[Path],
-        memo: Dict[Path, Set[Path]],
-        visiting: Set[Path],
-    ) -> Set[Path]:
-        if file_path in memo:
-            return memo[file_path]
-
-        if file_path in visiting:
-            return set()
-
-        visiting.add(file_path)
-        gateways: Set[Path] = set()
-
-        if file_path in direct_includers:
-            gateways.add(file_path)
-
-        for child in lookup.get(file_path, set()):
-            if child == target:
-                continue
-
-            child_transitive = transitive_cache.get(child)
-            if child_transitive is None:
-                child_transitive = self.collect_transitive_includes(child, lookup, {}, set())
-                transitive_cache[child] = child_transitive
-
-            if target in child_transitive:
-                gateways.update(
-                    self._collect_direct_gateways(
-                        child,
-                        lookup,
-                        transitive_cache,
-                        target,
-                        direct_includers,
-                        memo,
-                        visiting,
-                    )
-                )
-
-        visiting.remove(file_path)
-        memo[file_path] = gateways
-        return gateways
-
     def _calculate_dependents_data(
         self,
         target_file: Path,
         workers: Optional[int] = None,
         use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
-    ) -> tuple[Path, Set[Path], Set[Path], Counter[Path]]:
+    ) -> tuple[Path, Set[Path], Set[Path], Counter[Path], Dict[Path, Set[Path]]]:
         self._emit_progress(progress_cb, "Building project include index...", 5)
         lookup = self.build_include_lookup(
             progress_cb=progress_cb,
@@ -753,60 +705,64 @@ class IncludeAnalyzer:
             use_cached=use_cached,
         )
         target = self._validate_target(lookup, target_file)
+
+        self._emit_progress(progress_cb, "Computing transitive includes...", 48)
         transitive_cache = self._build_transitive_cache(
             lookup,
             progress_cb=progress_cb,
-            progress_start=45,
-            progress_end=70,
+            progress_start=48,
+            progress_end=75,
             workers=workers,
         )
 
-        direct_includers = {file_path for file_path, includes in lookup.items() if target in includes}
-        including_files = {file_path for file_path, transitive in transitive_cache.items() if target in transitive}
+        self._emit_progress(progress_cb, "Identifying includers...", 78)
 
+        # Direct includers: files whose direct include set contains target.
+        direct_includers = {fp for fp, includes in lookup.items() if target in includes}
+
+        # All includers: files whose transitive include set contains target.
+        including_files = {fp for fp, trans in transitive_cache.items() if target in trans}
+
+        # For each file compute its gateway set (which direct includers
+        # of target sit in the file's own transitive include set).
+        self._emit_progress(progress_cb, "Computing breakdown...", 82)
         breakdown: Counter[Path] = Counter()
-        if direct_includers:
-            memo: Dict[Path, Set[Path]] = {}
-            including_files_list = sorted(including_files)
-            total_including = max(1, len(including_files_list))
-            for index, file_path in enumerate(including_files_list, start=1):
-                gateways = self._collect_direct_gateways(
-                    file_path,
-                    lookup,
-                    transitive_cache,
-                    target,
-                    direct_includers,
-                    memo,
-                    set(),
-                )
+        gateway_map: Dict[Path, Set[Path]] = {}
+        transitive_only = sorted(including_files - direct_includers)
+        total = max(1, len(transitive_only))
 
-                for gateway in gateways:
-                    breakdown[gateway] += 1
+        # Every direct includer is its own gateway (count = 1).
+        for di in direct_includers:
+            breakdown[di] = 1
+            gateway_map[di] = {di}
 
-                progress_value = 70 + 25 * (index / total_including)
+        # Attribute transitive-only includers to their gateways.
+        for idx, file_path in enumerate(transitive_only, start=1):
+            trans = transitive_cache.get(file_path, set())
+            gateways = trans & direct_includers
+            gateway_map[file_path] = gateways
+            for gw in gateways:
+                breakdown[gw] += 1
+            if idx % 200 == 0 or idx == total:
                 self._emit_progress(
                     progress_cb,
-                    f"Evaluating dependents... ({index}/{total_including})",
-                    progress_value,
+                    f"Computing breakdown... ({idx}/{total})",
+                    82 + 15 * (idx / total),
                 )
 
-            for includer in direct_includers:
-                breakdown.setdefault(includer, 0)
-        else:
-            self._emit_progress(progress_cb, "Evaluating dependents...", 95)
-
-        return target, direct_includers, including_files, breakdown
+        return target, direct_includers, including_files, breakdown, gateway_map
 
     def report_dependents(
         self,
         target_file: Path,
         include_breakdown: bool = False,
         hide_cpp_in_breakdown: bool = True,
+        show_detail: bool = False,
         workers: Optional[int] = None,
         use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
     ) -> str:
-        target, direct_includers, including_files, breakdown = self._calculate_dependents_data(
+        target, direct_includers, including_files, breakdown, gateway_map = self._calculate_dependents_data(
             target_file,
             workers=workers,
             use_cached=use_cached,
@@ -839,27 +795,70 @@ class IncludeAnalyzer:
         lines.extend(self._format_markdown_table(["Category", ".h", ".cpp", "Other"], split_rows))
         lines.append("")
 
-        if not include_breakdown:
-            self._emit_progress(progress_cb, "Done", 100)
-            return "\n".join(lines)
+        if include_breakdown:
+            lines.append("## Direct Includer Breakdown")
 
-        lines.append("## Direct Includer Breakdown")
+            printed = False
+            breakdown_rows: List[List[str]] = []
+            for path, count in breakdown.most_common():
+                if hide_cpp_in_breakdown and path.suffix.lower() == ".cpp":
+                    continue
+                breakdown_rows.append([self._display_path(path), str(count)])
+                printed = True
 
-        printed = False
-        breakdown_rows: List[List[str]] = []
-        for path, count in breakdown.most_common():
-            if hide_cpp_in_breakdown and path.suffix.lower() == ".cpp":
-                continue
-            adjusted_count = max(0, count - 1)
-            if adjusted_count == 0:
-                continue
-            breakdown_rows.append([self._display_path(path), str(adjusted_count)])
-            printed = True
+            if not printed:
+                lines.append("No direct includers discovered; nothing to list.")
+            else:
+                lines.extend(self._format_markdown_table(["Direct Includer", "Files Through Gateway"], breakdown_rows))
+            lines.append("")
 
-        if not printed:
-            lines.append("No direct includers discovered; nothing to list.")
-        else:
-            lines.extend(self._format_markdown_table(["Direct Includer", "Including Files"], breakdown_rows))
+        if show_detail:
+            transitive_only = including_files - direct_includers
+            no_gateway = {fp for fp in transitive_only if not gateway_map.get(fp)}
+
+            lines.append("## Diagnostic Detail")
+            lines.append("")
+            diag_rows = [
+                ["Direct includers", str(len(direct_includers))],
+                ["Transitive-only includers", str(len(transitive_only))],
+                ["Transitive-only with NO gateway found", str(len(no_gateway))],
+                ["Sum of breakdown counts", str(sum(breakdown.values()))],
+            ]
+            lines.extend(self._format_markdown_table(["Metric", "Value"], diag_rows))
+            lines.append("")
+
+            # --- Direct includers ---
+            lines.append("### Direct Includers")
+            lines.append("")
+            direct_rows: List[List[str]] = []
+            for fp in sorted(direct_includers):
+                direct_rows.append([self._display_path(fp)])
+            if direct_rows:
+                lines.extend(self._format_markdown_table(["File"], direct_rows))
+            else:
+                lines.append("(none)")
+            lines.append("")
+
+            # --- Transitive-only includers ---
+            lines.append("### Transitive-Only Includers")
+            lines.append("")
+            trans_rows: List[List[str]] = []
+            for fp in sorted(transitive_only):
+                gws = gateway_map.get(fp, set())
+                gw_display = ", ".join(sorted(self._display_path(g) for g in gws)) if gws else "**NONE FOUND**"
+                trans_rows.append([self._display_path(fp), gw_display])
+            if trans_rows:
+                lines.extend(self._format_markdown_table(["File", "Gateways"], trans_rows))
+            else:
+                lines.append("(none)")
+            lines.append("")
+
+            if no_gateway:
+                lines.append("### Unattributed Files (no gateway found)")
+                lines.append("")
+                for fp in sorted(no_gateway):
+                    lines.append(f"- {self._display_path(fp)}")
+                lines.append("")
 
         self._emit_progress(progress_cb, "Done", 100)
         return "\n".join(lines)
@@ -887,6 +886,7 @@ class IncludeAnalyzerGUI:
         self.top_n_var = StringVar(value="50")
         self.include_breakdown_var = BooleanVar(value=False)
         self.hide_cpp_in_breakdown_var = BooleanVar(value=True)
+        self.show_detail_var = BooleanVar(value=False)
         self.progress_value_var = DoubleVar(value=0.0)
         self.progress_status_var = StringVar(value="Ready")
         self.last_report = ""
@@ -964,6 +964,11 @@ class IncludeAnalyzerGUI:
             self.options_frame,
             text="Hide .cpp files in includer list",
             variable=self.hide_cpp_in_breakdown_var,
+        )
+        self.show_detail_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Show diagnostic detail (all includers + gateways)",
+            variable=self.show_detail_var,
         )
 
         self.paths_frame = ttk.LabelFrame(main_frame, text="Paths", padding=10)
@@ -1045,9 +1050,11 @@ class IncludeAnalyzerGUI:
         if mode == "Dependents report":
             self.include_breakdown_check.grid(row=1, column=0, sticky="w", pady=4)
             self.hide_cpp_in_breakdown_check.grid(row=2, column=0, sticky="w", pady=4)
+            self.show_detail_check.grid(row=3, column=0, sticky="w", pady=4)
         else:
             self.include_breakdown_var.set(False)
             self.hide_cpp_in_breakdown_var.set(True)
+            self.show_detail_var.set(False)
 
         for child in self.paths_frame.winfo_children():
             grid_forget = getattr(child, "grid_forget", None)
@@ -1196,6 +1203,7 @@ class IncludeAnalyzerGUI:
                     file_path,
                     include_breakdown=self.include_breakdown_var.get(),
                     hide_cpp_in_breakdown=self.hide_cpp_in_breakdown_var.get(),
+                    show_detail=self.show_detail_var.get(),
                     workers=workers,
                     use_cached=use_cached,
                     progress_cb=self._set_progress,
