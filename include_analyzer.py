@@ -695,7 +695,7 @@ class IncludeAnalyzer:
         workers: Optional[int] = None,
         use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
-    ) -> tuple[Path, Set[Path], Set[Path], Counter[Path], Dict[Path, Set[Path]]]:
+    ) -> tuple[Path, Set[Path], Set[Path], Counter[Path], Dict[Path, Set[Path]], Dict[Path, Set[Path]]]:
         self._emit_progress(progress_cb, "Building project include index...", 5)
         lookup = self.build_include_lookup(
             progress_cb=progress_cb,
@@ -750,19 +750,20 @@ class IncludeAnalyzer:
                     82 + 15 * (idx / total),
                 )
 
-        return target, direct_includers, including_files, breakdown, gateway_map
+        return target, direct_includers, including_files, breakdown, gateway_map, transitive_cache
 
     def report_dependents(
         self,
         target_file: Path,
         include_breakdown: bool = False,
+        include_dependents_include_sum: bool = False,
         hide_cpp_in_breakdown: bool = True,
         show_detail: bool = False,
         workers: Optional[int] = None,
         use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
     ) -> str:
-        target, direct_includers, including_files, breakdown, gateway_map = self._calculate_dependents_data(
+        target, direct_includers, including_files, breakdown, gateway_map, transitive_cache = self._calculate_dependents_data(
             target_file,
             workers=workers,
             use_cached=use_cached,
@@ -777,10 +778,35 @@ class IncludeAnalyzer:
 
         summary_rows = [
             ["Project root", str(self.project_root)],
-            ["Target file", str(target)],
+            ["Target file", self._display_path(target)],
             ["Direct includers", str(len(direct_includers))],
             ["Total includers (direct + transitive)", str(len(including_files))],
         ]
+
+        if include_dependents_include_sum:
+            dependents_unique_include_sum = 0
+            dependents_split_sum = {".h": 0, ".cpp": 0, "other": 0}
+            for dependent in including_files:
+                includes_for_dependent = transitive_cache.get(dependent, set())
+                dependents_unique_include_sum += len(includes_for_dependent)
+                split = self._split_cpp_h_counts(includes_for_dependent)
+                dependents_split_sum[".h"] += split[".h"]
+                dependents_split_sum[".cpp"] += split[".cpp"]
+                dependents_split_sum["other"] += split["other"]
+
+            summary_rows.append(
+                [
+                    "Sum of each includer's unique includes",
+                    str(dependents_unique_include_sum),
+                ]
+            )
+            summary_rows.append(
+                [
+                    "Dependent include sum split (.h / .cpp / other)",
+                    f"{dependents_split_sum['.h']} / {dependents_split_sum['.cpp']} / {dependents_split_sum['other']}",
+                ]
+            )
+
         lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
         lines.append("")
 
@@ -885,6 +911,7 @@ class IncludeAnalyzerGUI:
         self.header_ranking_sort_var = StringVar(value="total")
         self.top_n_var = StringVar(value="50")
         self.include_breakdown_var = BooleanVar(value=False)
+        self.include_dependents_include_sum_var = BooleanVar(value=False)
         self.hide_cpp_in_breakdown_var = BooleanVar(value=True)
         self.show_detail_var = BooleanVar(value=False)
         self.progress_value_var = DoubleVar(value=0.0)
@@ -959,6 +986,11 @@ class IncludeAnalyzerGUI:
             self.options_frame,
             text="Show breakdown",
             variable=self.include_breakdown_var,
+        )
+        self.include_dependents_include_sum_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Add sum of each includer's unique includes",
+            variable=self.include_dependents_include_sum_var,
         )
         self.hide_cpp_in_breakdown_check = ttk.Checkbutton(
             self.options_frame,
@@ -1049,10 +1081,12 @@ class IncludeAnalyzerGUI:
 
         if mode == "Dependents report":
             self.include_breakdown_check.grid(row=1, column=0, sticky="w", pady=4)
-            self.hide_cpp_in_breakdown_check.grid(row=2, column=0, sticky="w", pady=4)
-            self.show_detail_check.grid(row=3, column=0, sticky="w", pady=4)
+            self.include_dependents_include_sum_check.grid(row=2, column=0, sticky="w", pady=4)
+            self.hide_cpp_in_breakdown_check.grid(row=3, column=0, sticky="w", pady=4)
+            self.show_detail_check.grid(row=4, column=0, sticky="w", pady=4)
         else:
             self.include_breakdown_var.set(False)
+            self.include_dependents_include_sum_var.set(False)
             self.hide_cpp_in_breakdown_var.set(True)
             self.show_detail_var.set(False)
 
@@ -1202,6 +1236,7 @@ class IncludeAnalyzerGUI:
                 report = analyzer.report_dependents(
                     file_path,
                     include_breakdown=self.include_breakdown_var.get(),
+                    include_dependents_include_sum=self.include_dependents_include_sum_var.get(),
                     hide_cpp_in_breakdown=self.hide_cpp_in_breakdown_var.get(),
                     show_detail=self.show_detail_var.get(),
                     workers=workers,

@@ -9,6 +9,7 @@ Single-file C++ include analysis tool with a desktop GUI.
 - **File include analysis**: shows transitive includes for a selected input file, with include paths.
 - **Project totals**: shows unique transitive include totals project-wide, with an optional all-header include analysis that reports Top N headers by transitive include reach.
 - **Dependents report**: shows how many files include a target file (directly and transitively), with optional breakdown and a default-on option to hide `.cpp` entries in the includer list.
+- **Dependents report** can also optionally add the sum of each includer's own unique transitive includes (equivalent to summing file-include-analysis totals over all dependents).
 
 ## Run
 
