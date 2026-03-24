@@ -139,7 +139,6 @@ class IncludeAnalyzer:
         progress_start: float = 0.0,
         progress_end: float = 100.0,
         workers: Optional[int] = None,
-        use_cached: bool = True,
     ) -> Dict[Path, Set[Path]]:
         project_files = self.find_project_files()
         filtered_files = {path for path in project_files if not self._is_thirdparty(path, self.project_root)}
@@ -151,7 +150,6 @@ class IncludeAnalyzer:
             workers=workers,
             include_thirdparty=False,
             cache_key="lookup_filtered",
-            use_cached=use_cached,
             progress_cb=progress_cb,
             progress_start=progress_start,
             progress_end=progress_end,
@@ -184,7 +182,6 @@ class IncludeAnalyzer:
         workers: int,
         include_thirdparty: bool,
         cache_key: str,
-        use_cached: bool,
         progress_cb: Optional[Callable[[str, float], None]],
         progress_start: float,
         progress_end: float,
@@ -193,14 +190,13 @@ class IncludeAnalyzer:
         sorted_files = sorted(source_files)
         workers = max(1, min(workers, max(1, len(sorted_files))))
 
-        if use_cached:
-            with self._cache_lock:
-                cached = self.direct_graph_cache.get(cache_key)
-                if cached is not None:
-                    cached_source_files, cached_graph = cached
-                    if cached_source_files == source_files:
-                        self._emit_progress(progress_cb, f"{progress_message} (cached)", progress_end)
-                        return cached_graph
+        with self._cache_lock:
+            cached = self.direct_graph_cache.get(cache_key)
+            if cached is not None:
+                cached_source_files, cached_graph = cached
+                if cached_source_files == source_files:
+                    self._emit_progress(progress_cb, f"{progress_message} (cached)", progress_end)
+                    return cached_graph
 
         graph: Dict[Path, Set[Path]] = {}
         total_files = max(1, len(sorted_files))
@@ -268,7 +264,6 @@ class IncludeAnalyzer:
         self,
         input_file: Path,
         workers: Optional[int] = None,
-        use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
     ) -> str:
         start_file = self._canonical(input_file)
@@ -287,7 +282,6 @@ class IncludeAnalyzer:
             workers=workers,
             include_thirdparty=True,
             cache_key="file_all",
-            use_cached=use_cached,
             progress_cb=progress_cb,
             progress_start=10,
             progress_end=70,
@@ -384,12 +378,13 @@ class IncludeAnalyzer:
     def report_project_totals(
         self,
         headers_only: bool = False,
+        include_project_include_sum: bool = False,
+        include_project_include_sum_cpp_only: bool = True,
         include_header_ranking: bool = False,
         top_n: int = 50,
         header_ranking_count_transitive: bool = True,
         header_ranking_sort_by: str = "total",
         workers: Optional[int] = None,
-        use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
     ) -> str:
         self._emit_progress(progress_cb, "Building project include index...", 5)
@@ -398,7 +393,6 @@ class IncludeAnalyzer:
             progress_start=10,
             progress_end=55,
             workers=workers,
-            use_cached=use_cached,
         )
         transitive_cache = self._build_transitive_cache(
             lookup,
@@ -430,6 +424,45 @@ class IncludeAnalyzer:
             ["Transitive includes (unique project-wide)", str(len(project_wide_unique))],
             ["Transitive split (.h / .cpp / other)", f"{project_split['.h']} / {project_split['.cpp']} / {project_split['other']}"]
         ]
+
+        if include_project_include_sum:
+            project_include_sum = 0
+            project_include_sum_split = {".h": 0, ".cpp": 0, "other": 0}
+            sum_source_files = (
+                [file_path for file_path in transitive_cache if file_path.suffix.lower() == ".cpp"]
+                if include_project_include_sum_cpp_only
+                else list(transitive_cache.keys())
+            )
+
+            for file_path in sum_source_files:
+                includes = transitive_cache.get(file_path, set())
+                if headers_only:
+                    scoped_includes = {path for path in includes if path.suffix.lower() == ".h"}
+                else:
+                    scoped_includes = includes
+
+                project_include_sum += len(scoped_includes)
+                split = self._split_cpp_h_counts(scoped_includes)
+                project_include_sum_split[".h"] += split[".h"]
+                project_include_sum_split[".cpp"] += split[".cpp"]
+                project_include_sum_split["other"] += split["other"]
+
+            summary_rows.append(["Sum of each file's unique transitive includes", str(project_include_sum)])
+            summary_rows.append([
+                "Files counted in include sum",
+                (
+                    f"{len(sum_source_files)} (.cpp only)"
+                    if include_project_include_sum_cpp_only
+                    else f"{len(sum_source_files)} (all files)"
+                ),
+            ])
+            summary_rows.append(
+                [
+                    "Per-file transitive include sum split (.h / .cpp / other)",
+                    f"{project_include_sum_split['.h']} / {project_include_sum_split['.cpp']} / {project_include_sum_split['other']}",
+                ]
+            )
+
         lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
         lines.append("")
 
@@ -693,7 +726,6 @@ class IncludeAnalyzer:
         self,
         target_file: Path,
         workers: Optional[int] = None,
-        use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
     ) -> tuple[Path, Set[Path], Set[Path], Counter[Path], Dict[Path, Set[Path]], Dict[Path, Set[Path]]]:
         self._emit_progress(progress_cb, "Building project include index...", 5)
@@ -702,7 +734,6 @@ class IncludeAnalyzer:
             progress_start=10,
             progress_end=45,
             workers=workers,
-            use_cached=use_cached,
         )
         target = self._validate_target(lookup, target_file)
 
@@ -757,16 +788,15 @@ class IncludeAnalyzer:
         target_file: Path,
         include_breakdown: bool = False,
         include_dependents_include_sum: bool = False,
+        include_dependents_include_sum_cpp_only: bool = True,
         hide_cpp_in_breakdown: bool = True,
         show_detail: bool = False,
         workers: Optional[int] = None,
-        use_cached: bool = True,
         progress_cb: Optional[Callable[[str, float], None]] = None,
     ) -> str:
         target, direct_includers, including_files, breakdown, gateway_map, transitive_cache = self._calculate_dependents_data(
             target_file,
             workers=workers,
-            use_cached=use_cached,
             progress_cb=progress_cb,
         )
 
@@ -786,7 +816,13 @@ class IncludeAnalyzer:
         if include_dependents_include_sum:
             dependents_unique_include_sum = 0
             dependents_split_sum = {".h": 0, ".cpp": 0, "other": 0}
-            for dependent in including_files:
+            sum_dependents = (
+                {path for path in including_files if path.suffix.lower() == ".cpp"}
+                if include_dependents_include_sum_cpp_only
+                else set(including_files)
+            )
+
+            for dependent in sum_dependents:
                 includes_for_dependent = transitive_cache.get(dependent, set())
                 dependents_unique_include_sum += len(includes_for_dependent)
                 split = self._split_cpp_h_counts(includes_for_dependent)
@@ -798,6 +834,16 @@ class IncludeAnalyzer:
                 [
                     "Sum of each includer's unique includes",
                     str(dependents_unique_include_sum),
+                ]
+            )
+            summary_rows.append(
+                [
+                    "Includers counted in include sum",
+                    (
+                        f"{len(sum_dependents)} (.cpp only)"
+                        if include_dependents_include_sum_cpp_only
+                        else f"{len(sum_dependents)} (all includers)"
+                    ),
                 ]
             )
             summary_rows.append(
@@ -904,14 +950,16 @@ class IncludeAnalyzerGUI:
         self.file_label_var = StringVar(value="Input file:")
         self.analysis_mode_var = StringVar(value="File include analysis")
         self.worker_count_var = StringVar(value=str(IncludeAnalyzer.recommended_worker_count()))
-        self.reuse_cache_var = BooleanVar(value=True)
         self.headers_only_var = BooleanVar(value=False)
+        self.include_project_include_sum_var = BooleanVar(value=False)
+        self.include_project_include_sum_cpp_only_var = BooleanVar(value=True)
         self.include_header_ranking_var = BooleanVar(value=False)
         self.header_ranking_count_transitive_var = BooleanVar(value=True)
         self.header_ranking_sort_var = StringVar(value="total")
         self.top_n_var = StringVar(value="50")
         self.include_breakdown_var = BooleanVar(value=False)
         self.include_dependents_include_sum_var = BooleanVar(value=False)
+        self.include_dependents_include_sum_cpp_only_var = BooleanVar(value=True)
         self.hide_cpp_in_breakdown_var = BooleanVar(value=True)
         self.show_detail_var = BooleanVar(value=False)
         self.progress_value_var = DoubleVar(value=0.0)
@@ -950,11 +998,6 @@ class IncludeAnalyzerGUI:
 
         self.worker_count_label = ttk.Label(self.options_frame, text="Threads:")
         self.worker_count_entry = ttk.Entry(self.options_frame, textvariable=self.worker_count_var, width=10)
-        self.reuse_cache_check = ttk.Checkbutton(
-            self.options_frame,
-            text="Reuse cache between runs",
-            variable=self.reuse_cache_var,
-        )
 
         self.headers_only_check = ttk.Checkbutton(
             self.options_frame,
@@ -966,6 +1009,17 @@ class IncludeAnalyzerGUI:
             text="Analyze all headers and show Top N",
             variable=self.include_header_ranking_var,
             command=self._refresh_dynamic_sections,
+        )
+        self.include_project_include_sum_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Add sum of each file's unique transitive includes",
+            variable=self.include_project_include_sum_var,
+            command=self._refresh_dynamic_sections,
+        )
+        self.include_project_include_sum_cpp_only_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Only count .cpp files for include sum",
+            variable=self.include_project_include_sum_cpp_only_var,
         )
         self.header_ranking_count_transitive_check = ttk.Checkbutton(
             self.options_frame,
@@ -991,6 +1045,12 @@ class IncludeAnalyzerGUI:
             self.options_frame,
             text="Add sum of each includer's unique includes",
             variable=self.include_dependents_include_sum_var,
+            command=self._refresh_dynamic_sections,
+        )
+        self.include_dependents_include_sum_cpp_only_check = ttk.Checkbutton(
+            self.options_frame,
+            text="Only count .cpp includers for include sum",
+            variable=self.include_dependents_include_sum_cpp_only_var,
         )
         self.hide_cpp_in_breakdown_check = ttk.Checkbutton(
             self.options_frame,
@@ -1046,6 +1106,7 @@ class IncludeAnalyzerGUI:
 
         self.output_text = ScrolledText(output_frame, wrap="word")
         self.output_text.pack(fill="both", expand=True)
+        self.output_text.configure(state="disabled")
 
         self._refresh_dynamic_sections()
 
@@ -1062,19 +1123,23 @@ class IncludeAnalyzerGUI:
 
         self.worker_count_label.grid(row=0, column=0, sticky="w", pady=4)
         self.worker_count_entry.grid(row=0, column=1, sticky="w", padx=(6, 0), pady=4)
-        self.reuse_cache_check.grid(row=0, column=2, sticky="w", padx=(20, 0), pady=4)
 
         if mode == "Project totals":
             self.headers_only_check.grid(row=1, column=0, sticky="w", pady=4)
-            self.include_header_ranking_check.grid(row=2, column=0, sticky="w", pady=4)
+            self.include_project_include_sum_check.grid(row=2, column=0, sticky="w", pady=4)
+            if self.include_project_include_sum_var.get():
+                self.include_project_include_sum_cpp_only_check.grid(row=3, column=0, sticky="w", pady=4)
+            self.include_header_ranking_check.grid(row=4, column=0, sticky="w", pady=4)
             if self.include_header_ranking_var.get():
-                self.header_ranking_count_transitive_check.grid(row=3, column=0, sticky="w", pady=4)
-                self.top_n_label.grid(row=4, column=0, sticky="w", pady=4)
-                self.top_n_entry.grid(row=4, column=1, sticky="w", padx=(6, 0), pady=4)
-                self.header_ranking_sort_label.grid(row=5, column=0, sticky="w", pady=4)
-                self.header_ranking_sort_combo.grid(row=5, column=1, sticky="w", padx=(6, 0), pady=4)
+                self.header_ranking_count_transitive_check.grid(row=5, column=0, sticky="w", pady=4)
+                self.top_n_label.grid(row=6, column=0, sticky="w", pady=4)
+                self.top_n_entry.grid(row=6, column=1, sticky="w", padx=(6, 0), pady=4)
+                self.header_ranking_sort_label.grid(row=7, column=0, sticky="w", pady=4)
+                self.header_ranking_sort_combo.grid(row=7, column=1, sticky="w", padx=(6, 0), pady=4)
         else:
             self.headers_only_var.set(False)
+            self.include_project_include_sum_var.set(False)
+            self.include_project_include_sum_cpp_only_var.set(True)
             self.include_header_ranking_var.set(False)
             self.header_ranking_count_transitive_var.set(True)
             self.header_ranking_sort_var.set("total")
@@ -1082,11 +1147,14 @@ class IncludeAnalyzerGUI:
         if mode == "Dependents report":
             self.include_breakdown_check.grid(row=1, column=0, sticky="w", pady=4)
             self.include_dependents_include_sum_check.grid(row=2, column=0, sticky="w", pady=4)
-            self.hide_cpp_in_breakdown_check.grid(row=3, column=0, sticky="w", pady=4)
-            self.show_detail_check.grid(row=4, column=0, sticky="w", pady=4)
+            if self.include_dependents_include_sum_var.get():
+                self.include_dependents_include_sum_cpp_only_check.grid(row=3, column=0, sticky="w", pady=4)
+            self.hide_cpp_in_breakdown_check.grid(row=4, column=0, sticky="w", pady=4)
+            self.show_detail_check.grid(row=5, column=0, sticky="w", pady=4)
         else:
             self.include_breakdown_var.set(False)
             self.include_dependents_include_sum_var.set(False)
+            self.include_dependents_include_sum_cpp_only_var.set(True)
             self.hide_cpp_in_breakdown_var.set(True)
             self.show_detail_var.set(False)
 
@@ -1156,7 +1224,9 @@ class IncludeAnalyzerGUI:
         messagebox.showinfo("Cache cleared", "Cleared cached analysis data for all loaded projects.")
 
     def clear_output(self) -> None:
+        self.output_text.configure(state="normal")
         self.output_text.delete("1.0", "end")
+        self.output_text.configure(state="disabled")
         self.last_report = ""
 
     def copy_report(self) -> None:
@@ -1202,17 +1272,12 @@ class IncludeAnalyzerGUI:
             analyzer = self._get_analyzer(project_root)
             mode = self.analysis_mode_var.get()
             workers = self._require_positive_int(self.worker_count_var.get().strip(), "Threads")
-            use_cached = self.reuse_cache_var.get()
-
-            if not use_cached:
-                analyzer.clear_runtime_caches()
 
             if mode == "File include analysis":
                 file_path = self._require_file()
                 report = analyzer.report_file_include_analysis(
                     file_path,
                     workers=workers,
-                    use_cached=use_cached,
                     progress_cb=self._set_progress,
                 )
             elif mode == "Project totals":
@@ -1223,12 +1288,13 @@ class IncludeAnalyzerGUI:
 
                 report = analyzer.report_project_totals(
                     headers_only=self.headers_only_var.get(),
+                    include_project_include_sum=self.include_project_include_sum_var.get(),
+                    include_project_include_sum_cpp_only=self.include_project_include_sum_cpp_only_var.get(),
                     include_header_ranking=include_header_ranking,
                     top_n=top_n,
                     header_ranking_count_transitive=self.header_ranking_count_transitive_var.get(),
                     header_ranking_sort_by=self.header_ranking_sort_var.get(),
                     workers=workers,
-                    use_cached=use_cached,
                     progress_cb=self._set_progress,
                 )
             elif mode == "Dependents report":
@@ -1237,25 +1303,29 @@ class IncludeAnalyzerGUI:
                     file_path,
                     include_breakdown=self.include_breakdown_var.get(),
                     include_dependents_include_sum=self.include_dependents_include_sum_var.get(),
+                    include_dependents_include_sum_cpp_only=self.include_dependents_include_sum_cpp_only_var.get(),
                     hide_cpp_in_breakdown=self.hide_cpp_in_breakdown_var.get(),
                     show_detail=self.show_detail_var.get(),
                     workers=workers,
-                    use_cached=use_cached,
                     progress_cb=self._set_progress,
                 )
             else:
                 raise ValueError("Unsupported analysis mode selected.")
 
             self.last_report = report
+            self.output_text.configure(state="normal")
             self.output_text.delete("1.0", "end")
             self.output_text.insert("1.0", report)
+            self.output_text.configure(state="disabled")
             self._set_progress("Done", 100)
 
         except Exception as exc:
             error_message = f"{exc}\n\n{traceback.format_exc()}"
             messagebox.showerror("Analysis error", str(exc))
+            self.output_text.configure(state="normal")
             self.output_text.delete("1.0", "end")
             self.output_text.insert("1.0", error_message)
+            self.output_text.configure(state="disabled")
             self.last_report = ""
             self._set_progress("Failed", 0)
         finally:
