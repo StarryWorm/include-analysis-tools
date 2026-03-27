@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from enum import Enum
+import copy
 import os
 import re
 import threading
@@ -8,566 +11,277 @@ import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, DoubleVar, StringVar, Tk, filedialog, messagebox
+from tkinter import BooleanVar, DoubleVar, IntVar, StringVar, Tk, filedialog, messagebox
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable, Dict, List, Optional, Set
 
 
+@dataclass(slots=True)
+class FileIncludeData:
+    file_path: Path
+    direct_includes: Set[Path] = field(default_factory=set)
+    transitive_includes: Set[Path] = field(default_factory=set)
+
+@dataclass(slots=True)
+class FileIncludersData:
+    file_path: Path
+    direct_includers: Set[Path] = field(default_factory=set)
+    transitive_includers: Set[Path] = field(default_factory=set)
+
 class IncludeAnalyzer:
-    def __init__(self, project_root: Path):
-        self.project_root = project_root.resolve()
-        self.include_cache: Dict[Path, List[str]] = {}
-        self.file_paths_cache: Dict[tuple[str, Path], Optional[Path]] = {}
-        self.direct_graph_cache: Dict[str, tuple[Set[Path], Dict[Path, Set[Path]]]] = {}
-        self._cache_lock = threading.RLock()
+    project_root: Path
+    progress_cb: Optional[Callable[[str, float], None]]
+
+    _cache_lock: threading.RLock = threading.RLock()
+    project_files_cache: Set[Path] = set()
+    file_include_data_cache: Dict[Path, FileIncludeData] = {}
+    file_includers_data_cache: Dict[Path, FileIncludersData] = {}
+
+    workers: int = 1
+    
+    class ProgressValues(Enum):
+        INIT_START = 0
+        INIT_END = 5
+        SCANNING = INIT_END
+        SCANNED = 15
+        RESOLVING_DIRECT_INCLUDES = SCANNED
+        RESOLVED_DIRECT_INCLUDES = 30
+        RESOLVING_TRANSITIVE_INCLUDES = RESOLVED_DIRECT_INCLUDES
+        RESOLVED_TRANSITIVE_INCLUDES = 55
+        RESOLVING_INCLUDERS = RESOLVED_TRANSITIVE_INCLUDES
+        RESOLVED_INCLUDERS = 75
+        COMPUTING_REPORT_VALUES = RESOLVED_INCLUDERS
+        COMPUTED_REPORT_VALUES = 90
+        FORMATTING_OUTPUT = COMPUTED_REPORT_VALUES
+        DONE = 100
+
+    class ProgressMessages(Enum):
+        INIT = "Initializing analysis context"
+        SCANNING = "Scanning project files"
+        RESOLVING_DIRECT_INCLUDES = "Resolving direct includes"
+        RESOLVED_DIRECT_INCLUDES = "Direct includes resolved"
+        RESOLVING_TRANSITIVE_INCLUDES = "Resolving transitive includes"
+        RESOLVED_TRANSITIVE_INCLUDES = "Transitive includes resolved"
+        RESOLVING_INCLUDERS = "Resolving includers"
+        RESOLVED_INCLUDERS = "Includers resolved"
+        COMPUTING_REPORT_VALUES = "Computing report values"
+        COMPUTED_REPORT_VALUES = "Report values computed"
+        FORMATTING_OUTPUT = "Formatting report output"
+        DONE = "Done"
+
+    def __init__(self, project_root: Path, progress_cb: Optional[Callable[[str, float], None]] = None) -> None:
+        self.project_root = project_root
+        self.progress_cb = progress_cb
+
+    # Helper Methods #
 
     def clear_runtime_caches(self) -> None:
         with self._cache_lock:
-            self.include_cache.clear()
-            self.file_paths_cache.clear()
-            self.direct_graph_cache.clear()
+            self.project_files_cache.clear()
+            self.file_include_data_cache.clear()
 
-    @staticmethod
-    def _emit_progress(
-        progress_cb: Optional[Callable[[str, float], None]],
-        message: str,
-        value: float,
-    ) -> None:
-        if progress_cb is None:
+    def _emit_progress(self, message: str, value: float) -> None:
+        if self.progress_cb is None:
             return
-        safe_value = max(0.0, min(100.0, value))
-        progress_cb(message, safe_value)
 
-    @staticmethod
-    def _canonical(path: Path) -> Path:
-        return path.resolve()
+        self.progress_cb(message, max(0.0, min(100.0, value)))
 
     @staticmethod
     def recommended_worker_count() -> int:
         return max(1, (os.cpu_count() or 1) - 4)
 
-    @staticmethod
-    def _is_thirdparty(path: Path, project_root: Path) -> bool:
+    def _is_thirdparty(self, path: Path) -> bool:
         try:
-            relative_parts = path.resolve().relative_to(project_root.resolve()).parts
+            relative_parts = path.relative_to(self.project_root).parts
         except ValueError:
             return True
         return "thirdparty" in relative_parts
 
-    def find_project_files(self) -> Set[Path]:
+    # Analysis Methods #
+
+    def find_project_files(self) -> None:
         extensions = {".cpp", ".h"}
         cpp_files: Set[Path] = set()
 
         for root, dirs, files in os.walk(self.project_root):
-            dirs[:] = [
-                directory
-                for directory in dirs
-                if directory not in {".git", "__pycache__", "build", "bin", "obj", ".vscode", ".idea", ".scu"}
-            ]
+            dirs[:] = [directory for directory in dirs if directory not in {".git", "__pycache__", "build", "bin", "obj", ".vscode", ".idea", ".scu"}]
 
             for file_name in files:
                 if Path(file_name).suffix in extensions:
                     cpp_files.add(Path(root) / file_name)
 
-        return {self._canonical(path) for path in cpp_files}
+        self.project_files_cache = {path.resolve() for path in cpp_files}
 
-    def extract_includes(self, file_path: Path) -> List[str]:
-        file_path = self._canonical(file_path)
+    def _resolve_include_path(self, include_name: str, current_file: Path) -> Optional[Path]:
         with self._cache_lock:
-            cached = self.include_cache.get(file_path)
-        if cached is not None:
-            return cached
+            project_files = self.project_files_cache
 
-        includes: List[str] = []
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as file_handle:
-                for line in file_handle:
-                    match = re.match(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]', line)
-                    if match:
-                        includes.append(match.group(1))
-        except OSError:
-            pass
-
-        with self._cache_lock:
-            self.include_cache[file_path] = includes
-        return includes
-
-    def resolve_include_path(self, include_name: str, current_file: Path, project_files: Set[Path]) -> Optional[Path]:
-        current_file = self._canonical(current_file)
-        cache_key = (include_name, current_file)
-
-        with self._cache_lock:
-            if cache_key in self.file_paths_cache:
-                return self.file_paths_cache[cache_key]
-
-        relative_path = self._canonical(current_file.parent / include_name)
+        relative_path = (current_file.parent / include_name).resolve()
         if relative_path in project_files:
-            with self._cache_lock:
-                self.file_paths_cache[cache_key] = relative_path
             return relative_path
 
-        root_relative_path = self._canonical(self.project_root / include_name)
+        root_relative_path = (self.project_root / include_name).resolve()
         if root_relative_path in project_files:
-            with self._cache_lock:
-                self.file_paths_cache[cache_key] = root_relative_path
             return root_relative_path
 
         include_filename = Path(include_name).name
         for project_file in project_files:
             if project_file.name == include_filename and str(project_file).endswith(include_name.replace("/", os.sep)):
-                with self._cache_lock:
-                    self.file_paths_cache[cache_key] = project_file
                 return project_file
 
-        include_parts = Path(include_name).parts
-        if len(include_parts) > 1:
-            for project_file in project_files:
-                project_parts = project_file.parts
-                if len(project_parts) >= len(include_parts) and project_parts[-len(include_parts):] == include_parts:
-                    with self._cache_lock:
-                        self.file_paths_cache[cache_key] = project_file
-                    return project_file
-
-        with self._cache_lock:
-            self.file_paths_cache[cache_key] = None
         return None
 
-    def build_include_lookup(
-        self,
-        progress_cb: Optional[Callable[[str, float], None]] = None,
-        progress_start: float = 0.0,
-        progress_end: float = 100.0,
-        workers: Optional[int] = None,
-    ) -> Dict[Path, Set[Path]]:
-        project_files = self.find_project_files()
-        filtered_files = {path for path in project_files if not self._is_thirdparty(path, self.project_root)}
-        if workers is None:
-            workers = self.recommended_worker_count()
-        return self._build_direct_include_graph(
-            project_files=project_files,
-            source_files=filtered_files,
-            workers=workers,
-            include_thirdparty=False,
-            cache_key="lookup_filtered",
-            progress_cb=progress_cb,
-            progress_start=progress_start,
-            progress_end=progress_end,
-            progress_message="Indexing include lookup",
-        )
-
-    def _resolve_direct_includes_for_file(
-        self,
-        file_path: Path,
-        project_files: Set[Path],
-        include_thirdparty: bool,
-    ) -> Set[Path]:
-        direct_includes: Set[Path] = set()
-        for include_name in self.extract_includes(file_path):
-            resolved = self.resolve_include_path(include_name, file_path, project_files)
-            if not resolved:
-                continue
-            resolved = self._canonical(resolved)
-            if resolved == file_path:
-                continue
-            if not include_thirdparty and self._is_thirdparty(resolved, self.project_root):
-                continue
-            direct_includes.add(resolved)
-        return direct_includes
-
-    def _build_direct_include_graph(
-        self,
-        project_files: Set[Path],
-        source_files: Set[Path],
-        workers: int,
-        include_thirdparty: bool,
-        cache_key: str,
-        progress_cb: Optional[Callable[[str, float], None]],
-        progress_start: float,
-        progress_end: float,
-        progress_message: str,
-    ) -> Dict[Path, Set[Path]]:
-        sorted_files = sorted(source_files)
-        workers = max(1, min(workers, max(1, len(sorted_files))))
-
+    def _resolve_direct_includes_for_file(self, file_path: Path) -> None:
         with self._cache_lock:
-            cached = self.direct_graph_cache.get(cache_key)
-            if cached is not None:
-                cached_source_files, cached_graph = cached
-                if cached_source_files == source_files:
-                    self._emit_progress(progress_cb, f"{progress_message} (cached)", progress_end)
-                    return cached_graph
+            if file_path in self.file_include_data_cache:
+                return
 
-        graph: Dict[Path, Set[Path]] = {}
-        total_files = max(1, len(sorted_files))
-        progress_span = max(0.0, progress_end - progress_start)
+        includes: Set[Path] = set()
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as file_handle:
+                for line in file_handle:
+                    match = re.match(r'^\s*#\s*include\s+[<"]([^>"]+)[>"]', line)
+                    if not match:
+                        continue
+                    resolved = self._resolve_include_path(match.group(1), file_path)
+                    if not resolved:
+                        continue
+                    if resolved == file_path:
+                        continue
+                    if self._is_thirdparty(resolved):
+                        continue
+                    includes.add(resolved)
+        except OSError:
+            pass
 
-        self._emit_progress(progress_cb, f"{progress_message}...", progress_start)
-
-        def process_file(cpp_file: Path) -> tuple[Path, Set[Path]]:
-            return cpp_file, self._resolve_direct_includes_for_file(cpp_file, project_files, include_thirdparty)
-
-        if workers == 1:
-            for index, cpp_file in enumerate(sorted_files, start=1):
-                file_key, includes = process_file(cpp_file)
-                graph[file_key] = includes
-                progress_value = progress_start + progress_span * (index / total_files)
-                self._emit_progress(progress_cb, f"{progress_message}... ({index}/{total_files})", progress_value)
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_map = {executor.submit(process_file, cpp_file): cpp_file for cpp_file in sorted_files}
-                completed = 0
-                for future in as_completed(future_map):
-                    file_key, includes = future.result()
-                    graph[file_key] = includes
-                    completed += 1
-                    progress_value = progress_start + progress_span * (completed / total_files)
-                    self._emit_progress(progress_cb, f"{progress_message}... ({completed}/{total_files})", progress_value)
-
+        includes.discard(file_path)
         with self._cache_lock:
-            self.direct_graph_cache[cache_key] = (set(source_files), graph)
+            self.file_include_data_cache[file_path] = FileIncludeData(file_path, includes)
 
-        return graph
+    def _build_direct_include_cache(self) -> None:
+        files = self.project_files_cache
 
-    def collect_transitive_includes(
-        self,
-        file_path: Path,
-        lookup: Dict[Path, Set[Path]],
-        memo: Dict[Path, Set[Path]],
-        visiting: Set[Path],
-    ) -> Set[Path]:
-        if file_path in memo:
-            return memo[file_path]
+        total_files = len(files)
+        progress_span = self.ProgressValues.RESOLVED_DIRECT_INCLUDES.value - self.ProgressValues.RESOLVING_DIRECT_INCLUDES.value
 
-        if file_path in visiting:
-            return set()
+        self._emit_progress(f"{self.ProgressMessages.RESOLVING_DIRECT_INCLUDES.value}...", self.ProgressValues.RESOLVING_DIRECT_INCLUDES.value)
 
-        visiting.add(file_path)
-        direct = lookup.get(file_path, set())
-        accumulated: Set[Path] = set(direct)
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            completed = 0
+            future_map = {executor.submit(self._resolve_direct_includes_for_file, cpp_file): cpp_file for cpp_file in files}
+            for future in as_completed(future_map):
+                completed += 1
+                progress_value = self.ProgressValues.RESOLVING_DIRECT_INCLUDES.value + progress_span * (completed / total_files)
+                self._emit_progress(f"{self.ProgressMessages.RESOLVING_DIRECT_INCLUDES.value}... ({completed}/{total_files})", progress_value)
+
+        self._emit_progress(f"{self.ProgressMessages.RESOLVED_DIRECT_INCLUDES.value}", self.ProgressValues.RESOLVED_DIRECT_INCLUDES.value)
+
+    def _populate_transitive_includes(self, file_path: Path,) -> bool:
+        with self._cache_lock:
+            file_data = self.file_include_data_cache.get(file_path)
+
+        if file_data is None:
+            self._resolve_direct_includes_for_file(file_path)
+            with self._cache_lock:
+                file_data = self.file_include_data_cache[file_path]
+
+        direct = file_data.direct_includes
+        previous_transitive = set(file_data.transitive_includes)
+        accumulated: Set[Path] = set()
 
         for child in direct:
-            accumulated.update(self.collect_transitive_includes(child, lookup, memo, visiting))
+            with self._cache_lock:
+                child_data = self.file_include_data_cache.get(child)
+                if child_data is None:
+                    continue
+                child_direct = child_data.direct_includes
+                child_transitive = child_data.transitive_includes
 
+            accumulated.update(child_direct)
+            accumulated.update(child_transitive)
+
+        accumulated.difference_update(direct)
         accumulated.discard(file_path)
-        visiting.remove(file_path)
-        memo[file_path] = accumulated
-        return accumulated
+
+        if accumulated == previous_transitive:
+            return False
+
+        file_data.transitive_includes = accumulated
+        with self._cache_lock:
+            self.file_include_data_cache[file_path] = file_data
+        return True
+
+    def _prepare_file_data_map(self) -> None:
+        with self._cache_lock:
+            files = list(self.file_include_data_cache.keys())
+
+        total_files = max(1, len(files))
+        progress_span = self.ProgressValues.RESOLVED_TRANSITIVE_INCLUDES.value - self.ProgressValues.RESOLVING_TRANSITIVE_INCLUDES.value
+        max_passes = 15
+
+        self._emit_progress(self.ProgressMessages.RESOLVING_TRANSITIVE_INCLUDES.value, self.ProgressValues.RESOLVING_TRANSITIVE_INCLUDES.value)
+
+        for pass_index in range(max_passes):
+            changed = False
+            with ThreadPoolExecutor(max_workers=max(1, self.workers)) as executor:
+                future_map = {executor.submit(self._populate_transitive_includes, file_path): file_path for file_path in files}
+                completed = 0
+                for future in as_completed(future_map):
+                    completed += 1
+                    if future.result():
+                        changed = True
+
+                    pass_progress = (pass_index + (completed / total_files)) / max_passes
+                    progress_value = self.ProgressValues.RESOLVING_TRANSITIVE_INCLUDES.value + progress_span * pass_progress
+                    self._emit_progress(f"Computing transitive includes... (pass {pass_index + 1}, {completed}/{total_files})", progress_value)
+
+            if not changed:
+                break
+        
+        self._emit_progress(self.ProgressMessages.RESOLVED_TRANSITIVE_INCLUDES.value, self.ProgressValues.RESOLVED_TRANSITIVE_INCLUDES.value)
+
+    def _prepare_includers_data_map(self) -> None:
+        self._emit_progress(self.ProgressMessages.RESOLVING_INCLUDERS.value, self.ProgressValues.RESOLVING_INCLUDERS.value)
+
+        file_data_map = self.file_include_data_cache
+        
+        progress_span : int = self.ProgressValues.RESOLVED_INCLUDERS.value - self.ProgressValues.RESOLVING_INCLUDERS.value
+        processed : int = 0
+        total_files : int = len(file_data_map)
+
+        includers_data: Dict[Path, FileIncludersData] = {}
+        for file_path in file_data_map:
+            for included in file_data_map[file_path].direct_includes:
+                includers_data.setdefault(included, FileIncludersData(included)).direct_includers.add(file_path)
+            for included in file_data_map[file_path].transitive_includes:
+                includers_data.setdefault(included, FileIncludersData(included)).transitive_includers.add(file_path)
+            processed += 1
+            self._emit_progress(f"Resolving includers... ({processed}/{total_files})", self.ProgressValues.RESOLVING_INCLUDERS.value + progress_span * (processed / total_files))
+
+        self.file_includers_data_cache = includers_data
+
+        self._emit_progress(self.ProgressMessages.RESOLVED_INCLUDERS.value, self.ProgressValues.RESOLVED_INCLUDERS.value)
+
+    def build_project_file_include_data(self) -> None:
+        if self.file_include_data_cache:
+            return
+
+        self.find_project_files()
+        if len(self.project_files_cache) == 0:
+            raise ValueError("No C++ source files found in the project root")
+        
+        self._build_direct_include_cache()
+        self._prepare_file_data_map()
+        self._prepare_includers_data_map()
+
+    # Reporting methods #
 
     def _display_path(self, path: Path) -> str:
         try:
-            return str(path.resolve().relative_to(self.project_root))
+            return str(path.relative_to(self.project_root))
         except ValueError:
-            return str(path.resolve())
-
-    def report_file_include_analysis(
-        self,
-        input_file: Path,
-        workers: Optional[int] = None,
-        progress_cb: Optional[Callable[[str, float], None]] = None,
-    ) -> str:
-        start_file = self._canonical(input_file)
-        if not start_file.exists():
-            raise FileNotFoundError(f"Input file not found: {start_file}")
-
-        if workers is None:
-            workers = self.recommended_worker_count()
-        workers = max(1, workers)
-
-        self._emit_progress(progress_cb, "Scanning project files...", 5)
-        project_files = self.find_project_files()
-        include_graph = self._build_direct_include_graph(
-            project_files=project_files,
-            source_files=project_files,
-            workers=workers,
-            include_thirdparty=True,
-            cache_key="file_all",
-            progress_cb=progress_cb,
-            progress_start=10,
-            progress_end=70,
-            progress_message="Pre-indexing direct includes",
-        )
-
-        visited: Set[Path] = set()
-        to_visit: List[tuple[Path, List[Path]]] = [(start_file, [])]
-        all_includes: Set[Path] = set()
-        include_paths: Dict[Path, List[List[Path]]] = {}
-        visit_budget = max(1, len(include_graph) + 1)
-
-        while to_visit:
-            current_file, current_path = to_visit.pop(0)
-            if current_file in visited:
-                continue
-
-            visited.add(current_file)
-            bfs_progress = 70 + 22 * (min(len(visited), visit_budget) / visit_budget)
-            self._emit_progress(
-                progress_cb,
-                f"Resolving include graph... ({len(visited)} visited)",
-                bfs_progress,
-            )
-
-            direct_includes = include_graph.get(current_file)
-            if direct_includes is None:
-                direct_includes = self._resolve_direct_includes_for_file(current_file, project_files, include_thirdparty=True)
-                include_graph[current_file] = direct_includes
-
-            for resolved_path in direct_includes:
-                if resolved_path == start_file:
-                    continue
-
-                resolved_path = self._canonical(resolved_path)
-                new_path = current_path + [current_file, resolved_path]
-
-                if resolved_path not in all_includes:
-                    all_includes.add(resolved_path)
-                    include_paths[resolved_path] = [new_path]
-                    to_visit.append((resolved_path, current_path + [current_file]))
-                elif new_path not in include_paths[resolved_path]:
-                    include_paths[resolved_path].append(new_path)
-
-        self._emit_progress(progress_cb, "Formatting report output...", 92)
-        included_split = self._split_cpp_h_counts(all_includes)
-
-        lines: List[str] = [
-            "# C++ Include Dependency Analysis",
-            "",
-            "## Summary",
-        ]
-
-        summary_rows = [
-            ["Input File", str(start_file)],
-            ["Project Root", str(self.project_root)],
-            ["Total Included Files", str(len(all_includes))],
-            [
-                "Included split (.h / .cpp / other)",
-                f"{included_split['.h']} / {included_split['.cpp']} / {included_split['other']}",
-            ],
-            ["Analysis Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-        ]
-        lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
-        lines.append("")
-
-        include_rows: List[List[str]] = []
-        for file_path in sorted(all_includes):
-            include_rows.append([self._display_path(file_path), str(len(include_paths.get(file_path, [])))])
-
-        lines.append("## Included Files")
-        if include_rows:
-            lines.extend(self._format_markdown_table(["File", "Path Count"], include_rows))
-        else:
-            lines.append("No included files found.")
-        lines.append("")
-
-        for file_path in sorted(all_includes):
-            lines.append(f"### {self._display_path(file_path)}")
-            path_rows: List[List[str]] = []
-            for path_index, include_path in enumerate(include_paths.get(file_path, []), start=1):
-                include_chain = " -> ".join(self._display_path(step) for step in include_path)
-                path_rows.append([str(path_index), include_chain])
-
-            if path_rows:
-                lines.extend(self._format_markdown_table(["Path #", "Include Chain"], path_rows))
-            else:
-                lines.append("No include paths found.")
-            lines.append("")
-
-        self._emit_progress(progress_cb, "Done", 100)
-        return "\n".join(lines)
-
-    def report_project_totals(
-        self,
-        headers_only: bool = False,
-        include_project_include_sum: bool = False,
-        include_project_include_sum_cpp_only: bool = True,
-        include_header_ranking: bool = False,
-        top_n: int = 50,
-        header_ranking_count_transitive: bool = True,
-        header_ranking_sort_by: str = "total",
-        workers: Optional[int] = None,
-        progress_cb: Optional[Callable[[str, float], None]] = None,
-    ) -> str:
-        self._emit_progress(progress_cb, "Building project include index...", 5)
-        lookup = self.build_include_lookup(
-            progress_cb=progress_cb,
-            progress_start=10,
-            progress_end=55,
-            workers=workers,
-        )
-        transitive_cache = self._build_transitive_cache(
-            lookup,
-            progress_cb=progress_cb,
-            progress_start=55,
-            progress_end=80,
-            workers=workers,
-        )
-        project_wide_unique: Set[Path] = set()
-
-        for file_path, includes in transitive_cache.items():
-            if headers_only:
-                project_wide_unique.update(path for path in includes if path.suffix == ".h")
-            else:
-                project_wide_unique.update(includes)
-
-        project_split = self._split_cpp_h_counts(project_wide_unique)
-
-        lines = [
-            "# Project Include Totals",
-            "",
-            "## Summary",
-        ]
-
-        summary_rows = [
-            ["Project root", str(self.project_root)],
-            ["Files analyzed", str(len(lookup))],
-            ["Count mode", "headers only (.h)" if headers_only else "all included files (.h + .cpp)"],
-            ["Transitive includes (unique project-wide)", str(len(project_wide_unique))],
-            ["Transitive split (.h / .cpp / other)", f"{project_split['.h']} / {project_split['.cpp']} / {project_split['other']}"]
-        ]
-
-        if include_project_include_sum:
-            project_include_sum = 0
-            project_include_sum_split = {".h": 0, ".cpp": 0, "other": 0}
-            sum_source_files = (
-                [file_path for file_path in transitive_cache if file_path.suffix.lower() == ".cpp"]
-                if include_project_include_sum_cpp_only
-                else list(transitive_cache.keys())
-            )
-
-            for file_path in sum_source_files:
-                includes = transitive_cache.get(file_path, set())
-                if headers_only:
-                    scoped_includes = {path for path in includes if path.suffix.lower() == ".h"}
-                else:
-                    scoped_includes = includes
-
-                project_include_sum += len(scoped_includes)
-                split = self._split_cpp_h_counts(scoped_includes)
-                project_include_sum_split[".h"] += split[".h"]
-                project_include_sum_split[".cpp"] += split[".cpp"]
-                project_include_sum_split["other"] += split["other"]
-
-            summary_rows.append(["Sum of each file's unique transitive includes", str(project_include_sum)])
-            summary_rows.append([
-                "Files counted in include sum",
-                (
-                    f"{len(sum_source_files)} (.cpp only)"
-                    if include_project_include_sum_cpp_only
-                    else f"{len(sum_source_files)} (all files)"
-                ),
-            ])
-            summary_rows.append(
-                [
-                    "Per-file transitive include sum split (.h / .cpp / other)",
-                    f"{project_include_sum_split['.h']} / {project_include_sum_split['.cpp']} / {project_include_sum_split['other']}",
-                ]
-            )
-
-        lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
-        lines.append("")
-
-        if include_header_ranking:
-            header_top, header_count, used_workers = self.analyze_all_headers_include_totals(
-                lookup,
-                top_n=top_n,
-                count_transitive=header_ranking_count_transitive,
-                sort_by=header_ranking_sort_by,
-                workers=workers,
-                progress_cb=progress_cb,
-                progress_start=80,
-                progress_end=98,
-            )
-
-            lines.append("## Header Include Analysis (Top N)")
-            meta_rows = [
-                ["Headers analyzed", str(header_count)],
-                ["Workers used", str(used_workers)],
-                ["Top N", str(max(1, top_n))],
-                ["Count transitive includes", "yes" if header_ranking_count_transitive else "no (direct only)"],
-                ["Sort by", header_ranking_sort_by],
-            ]
-            lines.extend(self._format_markdown_table(["Metric", "Value"], meta_rows))
-            lines.append("")
-
-            if not header_top:
-                lines.append("No headers found to analyze.")
-            else:
-                header_rows: List[List[str]] = []
-                for rank, (header_path, total_count, h_count, cpp_count, other_count) in enumerate(header_top, start=1):
-                    header_rows.append(
-                        [
-                            str(rank),
-                            self._display_path(header_path),
-                            str(total_count),
-                            str(h_count),
-                            str(cpp_count),
-                            str(other_count),
-                        ]
-                    )
-                lines.extend(self._format_markdown_table(["Rank", "Header", "Total", ".h", ".cpp", "Other"], header_rows))
-
-        self._emit_progress(progress_cb, "Done", 100)
-        return "\n".join(lines)
-
-    def _validate_target(self, lookup: Dict[Path, Set[Path]], target_file: Path) -> Path:
-        target = self._canonical(target_file)
-        if not target.exists():
-            raise FileNotFoundError(f"Target file not found: {target}")
-
-        if self._is_thirdparty(target, self.project_root):
-            raise ValueError("Target file resides in a thirdparty directory")
-
-        if target not in lookup and not any(target in includes for includes in lookup.values()):
-            return target
-
-        return target
-
-    def _build_transitive_cache(
-        self,
-        lookup: Dict[Path, Set[Path]],
-        progress_cb: Optional[Callable[[str, float], None]] = None,
-        progress_start: float = 0.0,
-        progress_end: float = 100.0,
-        workers: Optional[int] = None,
-    ) -> Dict[Path, Set[Path]]:
-        cache: Dict[Path, Set[Path]] = {}
-        if workers is None:
-            workers = self.recommended_worker_count()
-
-        workers = max(1, min(workers, max(1, len(lookup))))
-
-        total_files = max(1, len(lookup))
-        progress_span = max(0.0, progress_end - progress_start)
-
-        def process_file(file_path: Path) -> tuple[Path, Set[Path]]:
-            return file_path, self.collect_transitive_includes(file_path, lookup, {}, set())
-
-        if workers == 1:
-            for index, file_path in enumerate(lookup, start=1):
-                path_key, value = process_file(file_path)
-                cache[path_key] = value
-                progress_value = progress_start + progress_span * (index / total_files)
-                self._emit_progress(
-                    progress_cb,
-                    f"Computing transitive includes... ({index}/{total_files})",
-                    progress_value,
-                )
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_map = {executor.submit(process_file, file_path): file_path for file_path in lookup}
-                completed = 0
-                for future in as_completed(future_map):
-                    path_key, value = future.result()
-                    cache[path_key] = value
-                    completed += 1
-                    progress_value = progress_start + progress_span * (completed / total_files)
-                    self._emit_progress(
-                        progress_cb,
-                        f"Computing transitive includes... ({completed}/{total_files})",
-                        progress_value,
-                    )
-
-        return cache
+            return str(path)
 
     @staticmethod
     def _split_cpp_h_counts(paths: Set[Path]) -> Dict[str, int]:
@@ -601,113 +315,218 @@ class IncludeAnalyzer:
             lines.append("| " + " | ".join(cells) + " |")
         return lines
 
-    @staticmethod
-    def _collect_reachable_from_start(start: Path, lookup: Dict[Path, Set[Path]]) -> Set[Path]:
-        visited: Set[Path] = set()
-        stack: List[Path] = [start]
+    def report_file_include_analysis(self, input_file: Path) -> str:
+        self._emit_progress(self.ProgressMessages.COMPUTING_REPORT_VALUES.value, self.ProgressValues.COMPUTING_REPORT_VALUES.value)
 
-        while stack:
-            current = stack.pop()
-            for child in lookup.get(current, set()):
-                if child in visited:
+        start_file = input_file.resolve()
+        if not start_file.exists():
+            raise FileNotFoundError(f"Input file not found: {start_file}")
+
+        with self._cache_lock:
+            file_data_map = copy.deepcopy(self.file_include_data_cache)
+
+        start_data = file_data_map.get(start_file)
+        if start_data is None:
+            raise ValueError(f"Input file is not part of the indexed project: {start_file}")
+
+        all_includes: Set[Path] = start_data.direct_includes | start_data.transitive_includes
+        include_paths: Dict[Path, List[List[Path]]] = {path: [] for path in all_includes}
+        to_visit: List[tuple[Path, List[Path]]] = [(start_file, [start_file])]
+        visited_for_progress: Set[Path] = set()
+        visit_budget = len(file_data_map) + 1
+        bfs_progress_start = self.ProgressValues.COMPUTING_REPORT_VALUES.value
+        bfs_progress_span = self.ProgressValues.COMPUTED_REPORT_VALUES.value - self.ProgressValues.COMPUTING_REPORT_VALUES.value
+
+        while to_visit:
+            current_file, current_chain = to_visit.pop()
+            if current_file not in visited_for_progress:
+                visited_for_progress.add(current_file)
+                bfs_progress = bfs_progress_start + bfs_progress_span * (min(len(visited_for_progress), visit_budget) / visit_budget)
+                self._emit_progress(f"Resolving include graph... ({len(visited_for_progress)} visited)", bfs_progress)
+
+            for resolved_path in file_data_map.get(current_file, FileIncludeData(current_file)).direct_includes:
+                if resolved_path == start_file or resolved_path not in all_includes:
                     continue
-                visited.add(child)
-                stack.append(child)
 
-        visited.discard(start)
-        return visited
+                new_chain = current_chain + [resolved_path]
+                if new_chain not in include_paths[resolved_path]:
+                    include_paths[resolved_path].append(new_chain)
 
-    @staticmethod
-    def _build_reverse_lookup(lookup: Dict[Path, Set[Path]]) -> Dict[Path, Set[Path]]:
-        reverse_lookup: Dict[Path, Set[Path]] = {}
-        for parent, children in lookup.items():
-            reverse_lookup.setdefault(parent, set())
-            for child in children:
-                reverse_lookup.setdefault(child, set()).add(parent)
-        return reverse_lookup
-
-    @staticmethod
-    def _collect_reverse_reachable(start: Path, reverse_lookup: Dict[Path, Set[Path]]) -> Set[Path]:
-        visited: Set[Path] = set()
-        stack: List[Path] = [start]
-
-        while stack:
-            current = stack.pop()
-            for parent in reverse_lookup.get(current, set()):
-                if parent in visited:
+                if resolved_path in current_chain:
                     continue
-                visited.add(parent)
-                stack.append(parent)
+                to_visit.append((resolved_path, new_chain))
 
-        visited.discard(start)
-        return visited
+        self._emit_progress(self.ProgressMessages.FORMATTING_OUTPUT.value, self.ProgressValues.FORMATTING_OUTPUT.value)
+        included_split = self._split_cpp_h_counts(all_includes)
+
+        lines: List[str] = [
+            "# C++ Include Dependency Analysis",
+            "",
+            "## Summary",
+        ]
+
+        summary_rows = [
+            ["Input File", str(start_file)],
+            ["Project Root", str(self.project_root.parts[-1])],
+            ["Analysis Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Total Included Files", str(len(all_includes))],
+            ["Included split (.h / .cpp / other)", f"{included_split['.h']} / {included_split['.cpp']} / {included_split['other']}"]
+        ]
+        lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
+        lines.append("")
+
+        include_rows: List[List[str]] = []
+        for file_path in sorted(all_includes):
+            include_rows.append([self._display_path(file_path), str(len(include_paths.get(file_path, [])))])
+
+        lines.append("## Included Files")
+        if include_rows:
+            lines.extend(self._format_markdown_table(["File", "Path Count"], include_rows))
+        else:
+            lines.append("No included files found.")
+        lines.append("")
+
+        for file_path in sorted(all_includes):
+            lines.append(f"### {self._display_path(file_path)}")
+            path_rows: List[List[str]] = []
+            for path_index, include_path in enumerate(include_paths.get(file_path, []), start=1):
+                include_chain = " -> ".join(self._display_path(step) for step in include_path)
+                path_rows.append([str(path_index), include_chain])
+
+            if path_rows:
+                lines.extend(self._format_markdown_table(["Path #", "Include Chain"], path_rows))
+            else:
+                lines.append("No include paths found.")
+            lines.append("")
+
+        self._emit_progress(self.ProgressMessages.DONE.value, self.ProgressValues.DONE.value)
+        return "\n".join(lines)
+
+    def report_project_totals(
+        self,
+        include_project_include_sum: bool = False,
+        include_sum_cpp_only: bool = True,
+        include_header_ranking: bool = False,
+        top_n: int = 50,
+        header_ranking_count_transitive: bool = True,
+        header_ranking_sort_by: str = "total",
+    ) -> str:
+        self._emit_progress(self.ProgressMessages.COMPUTING_REPORT_VALUES.value, self.ProgressValues.COMPUTING_REPORT_VALUES.value)
+
+        with self._cache_lock:
+            file_data = copy.deepcopy(self.file_include_data_cache)
+
+        project_wide_unique: Set[Path] = set()
+        for data in file_data.values():
+            project_wide_unique.update(data.transitive_includes)
+
+        project_split = self._split_cpp_h_counts(project_wide_unique)
+
+        total_direct_includes = 0
+        direct_include_splits = {".h": 0, ".cpp": 0, "other": 0}
+        total_transitive_includes = 0
+        transitive_include_splits = {".h": 0, ".cpp": 0, "other": 0}
+        sum_source_files = {}
+        if include_project_include_sum:
+            sum_source_files = [file_path for file_path in file_data if file_path.suffix.lower() == ".cpp"] if include_sum_cpp_only else list(file_data.keys())
+            for file_path in sum_source_files:
+                total_direct_includes += len(file_data[file_path].direct_includes)
+                split = self._split_cpp_h_counts(file_data[file_path].direct_includes)
+                direct_include_splits[".h"] += split[".h"]
+                direct_include_splits[".cpp"] += split[".cpp"]
+                direct_include_splits["other"] += split["other"]
+
+                total_transitive_includes += len(file_data[file_path].transitive_includes)
+                split = self._split_cpp_h_counts(file_data[file_path].transitive_includes)
+                transitive_include_splits[".h"] += split[".h"]
+                transitive_include_splits[".cpp"] += split[".cpp"]
+                transitive_include_splits["other"] += split["other"]
+
+        header_top, header_count = ([], 0)
+        if include_header_ranking:
+            header_top, header_count = self.analyze_all_headers_include_totals(top_n=top_n, count_transitive=header_ranking_count_transitive, sort_by=header_ranking_sort_by)
+
+        self._emit_progress(self.ProgressMessages.FORMATTING_OUTPUT.value, self.ProgressValues.FORMATTING_OUTPUT.value)
+
+        lines = [
+            "# Project Include Totals",
+            "",
+            "## Summary",
+        ]
+
+        summary_rows = [
+            ["Project root", str(self.project_root.parts[-1])],
+            ["Files analyzed", str(len(file_data))],
+            ["Analysis Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Transitive includes (unique project-wide)", str(len(project_wide_unique))],
+            ["Transitive split (.h / .cpp / other)", f"{project_split['.h']} / {project_split['.cpp']} / {project_split['other']}"]
+        ]
+
+        if include_project_include_sum:
+            summary_rows.append(["Files counted in include sum", (f"{len(sum_source_files)} (.cpp only)" if include_sum_cpp_only else f"{len(sum_source_files)} (all files)")])
+            summary_rows.append(["Sum of each files unique includes: ", str(total_direct_includes + total_transitive_includes)])
+            summary_rows.append(["Sum of each file's unique direct includes", str(total_direct_includes)])
+            summary_rows.append(["Direct includes sum split (.h / .cpp / other)", f"{direct_include_splits['.h']} / {direct_include_splits['.cpp']} / {direct_include_splits['other']}"]) 
+            summary_rows.append(["Sum of each file's unique transitive includes", str(total_transitive_includes)])
+            summary_rows.append(["Transitive includes sum split (.h / .cpp / other)", f"{transitive_include_splits['.h']} / {transitive_include_splits['.cpp']} / {transitive_include_splits['other']}"])
+
+        lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
+        lines.append("")
+
+        if include_header_ranking:
+            lines.append("## Header Include Analysis (Top N)")
+            meta_rows = [
+                ["Headers analyzed", str(header_count)],
+                ["Top N", str(max(1, top_n))],
+                ["Count transitive includes", "yes" if header_ranking_count_transitive else "no (direct only)"],
+                ["Sort by", header_ranking_sort_by],
+            ]
+            lines.extend(self._format_markdown_table(["Metric", "Value"], meta_rows))
+            lines.append("")
+
+            if not header_top:
+                lines.append("No headers found to analyze.")
+            else:
+                header_rows: List[List[str]] = []
+                for rank, (header_path, total_count, h_count, cpp_count, other_count) in enumerate(header_top, start=1):
+                    header_rows.append(
+                        [
+                            str(rank),
+                            self._display_path(header_path),
+                            str(total_count),
+                            str(h_count),
+                            str(cpp_count),
+                            str(other_count),
+                        ]
+                    )
+                lines.extend(self._format_markdown_table(["Rank", "Header", "Total", ".h", ".cpp", "Other"], header_rows))
+
+        self._emit_progress(self.ProgressMessages.DONE.value, self.ProgressValues.DONE.value)
+        return "\n".join(lines)
 
     def analyze_all_headers_include_totals(
         self,
-        lookup: Dict[Path, Set[Path]],
         top_n: int = 50,
         count_transitive: bool = True,
-        sort_by: str = "total",
-        workers: Optional[int] = None,
-        progress_cb: Optional[Callable[[str, float], None]] = None,
-        progress_start: float = 0.0,
-        progress_end: float = 100.0,
-    ) -> tuple[List[tuple[Path, int, int, int, int]], int, int]:
-        headers = sorted(path for path in lookup if path.suffix.lower() == ".h")
+        sort_by: str = "total"
+    ) -> tuple[List[tuple[Path, int, int, int, int]], int]:
+        file_includers_map = copy.deepcopy(self.file_includers_data_cache)
+        headers = sorted(path for path in file_includers_map if path.suffix.lower() == ".h")
         header_count = len(headers)
 
-        if header_count == 0:
-            self._emit_progress(progress_cb, "Header analysis complete (0 headers)", progress_end)
-            return [], 0, 0
-
-        if workers is None:
-            workers = self.recommended_worker_count()
-
-        workers = max(1, min(workers, header_count))
-        top_n = max(1, top_n)
         sort_by = sort_by.lower().strip()
         if sort_by not in {"total", "h", "cpp"}:
             sort_by = "total"
-        progress_span = max(0.0, progress_end - progress_start)
-        reverse_lookup = self._build_reverse_lookup(lookup)
-
-        progress_title = "Analyzing transitive dependents for headers" if count_transitive else "Analyzing direct includers for headers"
-        self._emit_progress(progress_cb, f"{progress_title}...", progress_start)
 
         results: List[tuple[Path, int, int, int, int]] = []
-        if count_transitive:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_header = {
-                    executor.submit(self._collect_reverse_reachable, header, reverse_lookup): header for header in headers
-                }
-
-                completed = 0
-                for future in as_completed(future_to_header):
-                    header = future_to_header[future]
-                    includers = future.result()
-                    split = self._split_cpp_h_counts(includers)
-                    total_count = len(includers)
-                    results.append((header, total_count, split[".h"], split[".cpp"], split["other"]))
-
-                    completed += 1
-                    progress_value = progress_start + progress_span * (completed / header_count)
-                    self._emit_progress(
-                        progress_cb,
-                        f"{progress_title}... ({completed}/{header_count})",
-                        progress_value,
-                    )
-        else:
-            for index, header in enumerate(headers, start=1):
-                includers = reverse_lookup.get(header, set())
-                split = self._split_cpp_h_counts(includers)
-                total_count = len(includers)
-                results.append((header, total_count, split[".h"], split[".cpp"], split["other"]))
-                progress_value = progress_start + progress_span * (index / header_count)
-                self._emit_progress(
-                    progress_cb,
-                    f"{progress_title}... ({index}/{header_count})",
-                    progress_value,
-                )
+        for header in headers:
+            if header not in file_includers_map:
+                results.append((header, 0, 0, 0, 0))
+                continue
+            header_data = file_includers_map[header]
+            includers = header_data.transitive_includers if count_transitive else header_data.direct_includers
+            split = self._split_cpp_h_counts(includers)
+            results.append((header, len(includers), split[".h"], split[".cpp"], split["other"]))
 
         def sort_key(item: tuple[Path, int, int, int, int]) -> tuple[int, int, str]:
             _, total_count, h_count, cpp_count, _ = item
@@ -720,85 +539,48 @@ class IncludeAnalyzer:
             return (-metric, -total_count, str(item[0]).lower())
 
         results.sort(key=sort_key)
-        return results[:top_n], header_count, workers
-
-    def _calculate_dependents_data(
-        self,
-        target_file: Path,
-        workers: Optional[int] = None,
-        progress_cb: Optional[Callable[[str, float], None]] = None,
-    ) -> tuple[Path, Set[Path], Set[Path], Counter[Path], Dict[Path, Set[Path]], Dict[Path, Set[Path]]]:
-        self._emit_progress(progress_cb, "Building project include index...", 5)
-        lookup = self.build_include_lookup(
-            progress_cb=progress_cb,
-            progress_start=10,
-            progress_end=45,
-            workers=workers,
-        )
-        target = self._validate_target(lookup, target_file)
-
-        self._emit_progress(progress_cb, "Computing transitive includes...", 48)
-        transitive_cache = self._build_transitive_cache(
-            lookup,
-            progress_cb=progress_cb,
-            progress_start=48,
-            progress_end=75,
-            workers=workers,
-        )
-
-        self._emit_progress(progress_cb, "Identifying includers...", 78)
-
-        # Direct includers: files whose direct include set contains target.
-        direct_includers = {fp for fp, includes in lookup.items() if target in includes}
-
-        # All includers: files whose transitive include set contains target.
-        including_files = {fp for fp, trans in transitive_cache.items() if target in trans}
-
-        # For each file compute its gateway set (which direct includers
-        # of target sit in the file's own transitive include set).
-        self._emit_progress(progress_cb, "Computing breakdown...", 82)
-        breakdown: Counter[Path] = Counter()
-        gateway_map: Dict[Path, Set[Path]] = {}
-        transitive_only = sorted(including_files - direct_includers)
-        total = max(1, len(transitive_only))
-
-        # Every direct includer is its own gateway (count = 1).
-        for di in direct_includers:
-            breakdown[di] = 1
-            gateway_map[di] = {di}
-
-        # Attribute transitive-only includers to their gateways.
-        for idx, file_path in enumerate(transitive_only, start=1):
-            trans = transitive_cache.get(file_path, set())
-            gateways = trans & direct_includers
-            gateway_map[file_path] = gateways
-            for gw in gateways:
-                breakdown[gw] += 1
-            if idx % 200 == 0 or idx == total:
-                self._emit_progress(
-                    progress_cb,
-                    f"Computing breakdown... ({idx}/{total})",
-                    82 + 15 * (idx / total),
-                )
-
-        return target, direct_includers, including_files, breakdown, gateway_map, transitive_cache
+        return results[:top_n], header_count
 
     def report_dependents(
         self,
         target_file: Path,
         include_breakdown: bool = False,
         include_dependents_include_sum: bool = False,
-        include_dependents_include_sum_cpp_only: bool = True,
-        hide_cpp_in_breakdown: bool = True,
-        show_detail: bool = False,
-        workers: Optional[int] = None,
-        progress_cb: Optional[Callable[[str, float], None]] = None,
+        include_sum_cpp_only: bool = True,
+        hide_cpp_in_breakdown: bool = True
     ) -> str:
-        target, direct_includers, including_files, breakdown, gateway_map, transitive_cache = self._calculate_dependents_data(
-            target_file,
-            workers=workers,
-            progress_cb=progress_cb,
-        )
+        self._emit_progress(self.ProgressMessages.COMPUTING_REPORT_VALUES.value, self.ProgressValues.COMPUTING_REPORT_VALUES.value)
+
+        file_data = copy.deepcopy(self.file_include_data_cache)
+        file_includers_data = self.file_includers_data_cache[target_file]
+
+        direct_includers = file_includers_data.direct_includers
+        transitive_includers = file_includers_data.transitive_includers
+        including_files = direct_includers | transitive_includers
+
+        breakdown: Counter[Path] = Counter()
+
+        for includer in direct_includers:
+            breakdown[includer] = 0
+            includer_data = self.file_includers_data_cache.get(includer)
+            if includer_data is None:
+                continue
+            breakdown[includer] += len(includer_data.direct_includers | includer_data.transitive_includers)
+        
+        dependents_unique_include_sum = 0
+        dependents_split_sum = {".h": 0, ".cpp": 0, "other": 0}
+        sum_dependents = set()
+        if include_dependents_include_sum:            
+            sum_dependents = {path for path in including_files if path.suffix.lower() == ".cpp"} if include_sum_cpp_only else set(including_files)
+            for dependent in sum_dependents:
+                includes_for_dependent = file_data[dependent].transitive_includes
+                dependents_unique_include_sum += len(includes_for_dependent)
+                split = self._split_cpp_h_counts(includes_for_dependent)
+                dependents_split_sum[".h"] += split[".h"]
+                dependents_split_sum[".cpp"] += split[".cpp"]
+                dependents_split_sum["other"] += split["other"]
+
+        self._emit_progress(self.ProgressMessages.FORMATTING_OUTPUT.value, self.ProgressValues.FORMATTING_OUTPUT.value)
 
         lines = [
             "# Include Dependents Report",
@@ -807,61 +589,30 @@ class IncludeAnalyzer:
         ]
 
         summary_rows = [
-            ["Project root", str(self.project_root)],
-            ["Target file", self._display_path(target)],
+            ["Project root", str(self.project_root.parts[-1])],
+            ["Target file", self._display_path(target_file)],
+            ["Analysis Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
             ["Direct includers", str(len(direct_includers))],
-            ["Total includers (direct + transitive)", str(len(including_files))],
+            ["Transitive includers", str(len(transitive_includers))],
+            ["Total includers (direct + transitive)", str(len(including_files))]
         ]
 
         if include_dependents_include_sum:
-            dependents_unique_include_sum = 0
-            dependents_split_sum = {".h": 0, ".cpp": 0, "other": 0}
-            sum_dependents = (
-                {path for path in including_files if path.suffix.lower() == ".cpp"}
-                if include_dependents_include_sum_cpp_only
-                else set(including_files)
-            )
-
-            for dependent in sum_dependents:
-                includes_for_dependent = transitive_cache.get(dependent, set())
-                dependents_unique_include_sum += len(includes_for_dependent)
-                split = self._split_cpp_h_counts(includes_for_dependent)
-                dependents_split_sum[".h"] += split[".h"]
-                dependents_split_sum[".cpp"] += split[".cpp"]
-                dependents_split_sum["other"] += split["other"]
-
-            summary_rows.append(
-                [
-                    "Sum of each includer's unique includes",
-                    str(dependents_unique_include_sum),
-                ]
-            )
-            summary_rows.append(
-                [
-                    "Includers counted in include sum",
-                    (
-                        f"{len(sum_dependents)} (.cpp only)"
-                        if include_dependents_include_sum_cpp_only
-                        else f"{len(sum_dependents)} (all includers)"
-                    ),
-                ]
-            )
-            summary_rows.append(
-                [
-                    "Dependent include sum split (.h / .cpp / other)",
-                    f"{dependents_split_sum['.h']} / {dependents_split_sum['.cpp']} / {dependents_split_sum['other']}",
-                ]
-            )
+            summary_rows.append(["Sum of each includer's unique includes", str(dependents_unique_include_sum)])
+            summary_rows.append(["Includers counted in include sum",(f"{len(sum_dependents)} (.cpp only)" if include_sum_cpp_only else f"{len(sum_dependents)} (all includers)")])
+            summary_rows.append(["Dependent include sum split (.h / .cpp / other)", f"{dependents_split_sum['.h']} / {dependents_split_sum['.cpp']} / {dependents_split_sum['other']}"])
 
         lines.extend(self._format_markdown_table(["Metric", "Value"], summary_rows))
         lines.append("")
 
         direct_split = self._split_cpp_h_counts(direct_includers)
+        transitive_split = self._split_cpp_h_counts(transitive_includers)
         total_split = self._split_cpp_h_counts(including_files)
 
         lines.append("## Split Totals (.h / .cpp / other)")
         split_rows = [
             ["Direct includers", str(direct_split[".h"]), str(direct_split[".cpp"]), str(direct_split["other"])],
+            ["Transitive includers", str(transitive_split[".h"]), str(transitive_split[".cpp"]), str(transitive_split["other"])],
             ["Total includers", str(total_split[".h"]), str(total_split[".cpp"]), str(total_split["other"])],
         ]
         lines.extend(self._format_markdown_table(["Category", ".h", ".cpp", "Other"], split_rows))
@@ -875,99 +626,76 @@ class IncludeAnalyzer:
             for path, count in breakdown.most_common():
                 if hide_cpp_in_breakdown and path.suffix.lower() == ".cpp":
                     continue
+                if count < 1:
+                    continue
                 breakdown_rows.append([self._display_path(path), str(count)])
                 printed = True
 
             if not printed:
                 lines.append("No direct includers discovered; nothing to list.")
             else:
-                lines.extend(self._format_markdown_table(["Direct Includer", "Files Through Gateway"], breakdown_rows))
+                lines.extend(self._format_markdown_table(["Direct Includer", "Files Through Gateway (excludes self)"], breakdown_rows))
             lines.append("")
 
-        if show_detail:
-            transitive_only = including_files - direct_includers
-            no_gateway = {fp for fp in transitive_only if not gateway_map.get(fp)}
-
-            lines.append("## Diagnostic Detail")
-            lines.append("")
-            diag_rows = [
-                ["Direct includers", str(len(direct_includers))],
-                ["Transitive-only includers", str(len(transitive_only))],
-                ["Transitive-only with NO gateway found", str(len(no_gateway))],
-                ["Sum of breakdown counts", str(sum(breakdown.values()))],
-            ]
-            lines.extend(self._format_markdown_table(["Metric", "Value"], diag_rows))
-            lines.append("")
-
-            # --- Direct includers ---
-            lines.append("### Direct Includers")
-            lines.append("")
-            direct_rows: List[List[str]] = []
-            for fp in sorted(direct_includers):
-                direct_rows.append([self._display_path(fp)])
-            if direct_rows:
-                lines.extend(self._format_markdown_table(["File"], direct_rows))
-            else:
-                lines.append("(none)")
-            lines.append("")
-
-            # --- Transitive-only includers ---
-            lines.append("### Transitive-Only Includers")
-            lines.append("")
-            trans_rows: List[List[str]] = []
-            for fp in sorted(transitive_only):
-                gws = gateway_map.get(fp, set())
-                gw_display = ", ".join(sorted(self._display_path(g) for g in gws)) if gws else "**NONE FOUND**"
-                trans_rows.append([self._display_path(fp), gw_display])
-            if trans_rows:
-                lines.extend(self._format_markdown_table(["File", "Gateways"], trans_rows))
-            else:
-                lines.append("(none)")
-            lines.append("")
-
-            if no_gateway:
-                lines.append("### Unattributed Files (no gateway found)")
-                lines.append("")
-                for fp in sorted(no_gateway):
-                    lines.append(f"- {self._display_path(fp)}")
-                lines.append("")
-
-        self._emit_progress(progress_cb, "Done", 100)
+        self._emit_progress(self.ProgressMessages.DONE.value, self.ProgressValues.DONE.value)
         return "\n".join(lines)
-
-    def report_dependents_breakdown(self, target_file: Path) -> str:
-        return self.report_dependents(target_file, include_breakdown=True, hide_cpp_in_breakdown=True)
 
 
 class IncludeAnalyzerGUI:
-    def __init__(self, root: Tk):
-        self.root = root
+    root: Tk
+    
+    class AnalysisModes(Enum):
+        FILE_INCLUDE_ANALYSIS = "File include analysis"
+        PROJECT_TOTALS = "Project totals"
+        DEPENDENTS_REPORT = "Dependents report"
+
+    project_root_var: StringVar
+    file_var: StringVar
+    analysis_mode_var: StringVar
+    worker_count_var: IntVar
+    include_project_include_sum_var: BooleanVar
+    include_project_include_sum_cpp_only_var: BooleanVar
+    include_header_ranking_var: BooleanVar
+    header_ranking_count_transitive_var: BooleanVar
+    header_ranking_sort_str: StringVar
+    top_n_var: IntVar
+    include_breakdown_var: BooleanVar
+    include_dependents_include_sum_var: BooleanVar
+    include_dependents_include_sum_cpp_only_var: BooleanVar
+    hide_cpp_in_breakdown_var: BooleanVar
+    progress_value_var: DoubleVar
+    progress_status_var: StringVar
+    reports: List[str]
+    report_index: int
+    analyzer_instances: Dict[Path, IncludeAnalyzer]
+
+    def __init__(self):
+        self.root = Tk()
         self.root.title("Include Analyzer")
         self.root.geometry("1000x700")
 
         self.project_root_var = StringVar()
         self.file_var = StringVar()
-        self.file_label_var = StringVar(value="Input file:")
-        self.analysis_mode_var = StringVar(value="File include analysis")
-        self.worker_count_var = StringVar(value=str(IncludeAnalyzer.recommended_worker_count()))
-        self.headers_only_var = BooleanVar(value=False)
+        self.analysis_mode_var = StringVar(value=self.AnalysisModes.FILE_INCLUDE_ANALYSIS.value)
+        self.worker_count_var = IntVar(value=IncludeAnalyzer.recommended_worker_count())
         self.include_project_include_sum_var = BooleanVar(value=False)
         self.include_project_include_sum_cpp_only_var = BooleanVar(value=True)
         self.include_header_ranking_var = BooleanVar(value=False)
         self.header_ranking_count_transitive_var = BooleanVar(value=True)
-        self.header_ranking_sort_var = StringVar(value="total")
-        self.top_n_var = StringVar(value="50")
+        self.header_ranking_sort_str = StringVar(value="total")
+        self.top_n_var = IntVar(value=50)
         self.include_breakdown_var = BooleanVar(value=False)
         self.include_dependents_include_sum_var = BooleanVar(value=False)
         self.include_dependents_include_sum_cpp_only_var = BooleanVar(value=True)
         self.hide_cpp_in_breakdown_var = BooleanVar(value=True)
-        self.show_detail_var = BooleanVar(value=False)
         self.progress_value_var = DoubleVar(value=0.0)
         self.progress_status_var = StringVar(value="Ready")
-        self.last_report = ""
-        self.analyzer_instances: Dict[Path, IncludeAnalyzer] = {}
+        self.reports = []
+        self.report_index = 0
+        self.analyzer_instances = {}
 
         self._build_ui()
+        self.root.mainloop()
 
     def _build_ui(self) -> None:
         main_frame = ttk.Frame(self.root, padding=12)
@@ -976,17 +704,11 @@ class IncludeAnalyzerGUI:
         mode_frame = ttk.LabelFrame(main_frame, text="Analysis", padding=10)
         mode_frame.pack(fill="x")
 
-        analysis_values = [
-            "File include analysis",
-            "Project totals",
-            "Dependents report",
-        ]
-
         ttk.Label(mode_frame, text="Mode:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
         mode_combo = ttk.Combobox(
             mode_frame,
             textvariable=self.analysis_mode_var,
-            values=analysis_values,
+            values=[mode.value for mode in self.AnalysisModes],
             state="readonly",
             width=30,
         )
@@ -999,11 +721,6 @@ class IncludeAnalyzerGUI:
         self.worker_count_label = ttk.Label(self.options_frame, text="Threads:")
         self.worker_count_entry = ttk.Entry(self.options_frame, textvariable=self.worker_count_var, width=10)
 
-        self.headers_only_check = ttk.Checkbutton(
-            self.options_frame,
-            text="Headers only (.h)",
-            variable=self.headers_only_var,
-        )
         self.include_header_ranking_check = ttk.Checkbutton(
             self.options_frame,
             text="Analyze all headers and show Top N",
@@ -1029,7 +746,7 @@ class IncludeAnalyzerGUI:
         self.header_ranking_sort_label = ttk.Label(self.options_frame, text="Sort by:")
         self.header_ranking_sort_combo = ttk.Combobox(
             self.options_frame,
-            textvariable=self.header_ranking_sort_var,
+            textvariable=self.header_ranking_sort_str,
             values=["total", "h", "cpp"],
             state="readonly",
             width=10,
@@ -1057,11 +774,6 @@ class IncludeAnalyzerGUI:
             text="Hide .cpp files in includer list",
             variable=self.hide_cpp_in_breakdown_var,
         )
-        self.show_detail_check = ttk.Checkbutton(
-            self.options_frame,
-            text="Show diagnostic detail (all includers + gateways)",
-            variable=self.show_detail_var,
-        )
 
         self.paths_frame = ttk.LabelFrame(main_frame, text="Paths", padding=10)
         self.paths_frame.pack(fill="x", pady=(10, 0))
@@ -1070,7 +782,7 @@ class IncludeAnalyzerGUI:
         self.project_root_entry = ttk.Entry(self.paths_frame, textvariable=self.project_root_var)
         self.project_root_button = ttk.Button(self.paths_frame, text="Browse...", command=self._browse_project)
 
-        self.file_label = ttk.Label(self.paths_frame, textvariable=self.file_label_var)
+        self.file_label = ttk.Label(self.paths_frame, text="Input file:")
         self.file_entry = ttk.Entry(self.paths_frame, textvariable=self.file_var)
         self.file_button = ttk.Button(self.paths_frame, text="Browse...", command=self._browse_file)
 
@@ -1087,6 +799,10 @@ class IncludeAnalyzerGUI:
         self.copy_report_button.pack(side="left", padx=(8, 0))
         ttk.Button(button_frame, text="Save Report", command=self.save_report).pack(side="left", padx=(8, 0))
         ttk.Button(button_frame, text="Clear Output", command=self.clear_output).pack(side="left", padx=(8, 0))
+        self.next_report_button = ttk.Button(button_frame, text=">", command=self.show_next_report)
+        self.next_report_button.pack(side="right")
+        self.prev_report_button = ttk.Button(button_frame, text="<", command=self.show_previous_report)
+        self.prev_report_button.pack(side="right", padx=(0, 8))
 
         progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding=8)
         progress_frame.pack(fill="x", pady=(10, 0))
@@ -1109,6 +825,7 @@ class IncludeAnalyzerGUI:
         self.output_text.configure(state="disabled")
 
         self._refresh_dynamic_sections()
+        self._update_report_nav_state()
 
     def _on_mode_change(self, _event=None) -> None:
         self._refresh_dynamic_sections()
@@ -1125,7 +842,6 @@ class IncludeAnalyzerGUI:
         self.worker_count_entry.grid(row=0, column=1, sticky="w", padx=(6, 0), pady=4)
 
         if mode == "Project totals":
-            self.headers_only_check.grid(row=1, column=0, sticky="w", pady=4)
             self.include_project_include_sum_check.grid(row=2, column=0, sticky="w", pady=4)
             if self.include_project_include_sum_var.get():
                 self.include_project_include_sum_cpp_only_check.grid(row=3, column=0, sticky="w", pady=4)
@@ -1137,12 +853,11 @@ class IncludeAnalyzerGUI:
                 self.header_ranking_sort_label.grid(row=7, column=0, sticky="w", pady=4)
                 self.header_ranking_sort_combo.grid(row=7, column=1, sticky="w", padx=(6, 0), pady=4)
         else:
-            self.headers_only_var.set(False)
             self.include_project_include_sum_var.set(False)
             self.include_project_include_sum_cpp_only_var.set(True)
             self.include_header_ranking_var.set(False)
             self.header_ranking_count_transitive_var.set(True)
-            self.header_ranking_sort_var.set("total")
+            self.header_ranking_sort_str.set("total")
 
         if mode == "Dependents report":
             self.include_breakdown_check.grid(row=1, column=0, sticky="w", pady=4)
@@ -1150,13 +865,11 @@ class IncludeAnalyzerGUI:
             if self.include_dependents_include_sum_var.get():
                 self.include_dependents_include_sum_cpp_only_check.grid(row=3, column=0, sticky="w", pady=4)
             self.hide_cpp_in_breakdown_check.grid(row=4, column=0, sticky="w", pady=4)
-            self.show_detail_check.grid(row=5, column=0, sticky="w", pady=4)
         else:
             self.include_breakdown_var.set(False)
             self.include_dependents_include_sum_var.set(False)
             self.include_dependents_include_sum_cpp_only_var.set(True)
             self.hide_cpp_in_breakdown_var.set(True)
-            self.show_detail_var.set(False)
 
         for child in self.paths_frame.winfo_children():
             grid_forget = getattr(child, "grid_forget", None)
@@ -1167,13 +880,7 @@ class IncludeAnalyzerGUI:
         self.project_root_entry.grid(row=0, column=1, sticky="ew", pady=4)
         self.project_root_button.grid(row=0, column=2, padx=(6, 0), pady=4)
 
-        requires_file = mode in {"File include analysis", "Dependents report"}
-        if requires_file:
-            if mode == "File include analysis":
-                self.file_label_var.set("Input file:")
-            else:
-                self.file_label_var.set("Target file:")
-
+        if mode in {self.AnalysisModes.FILE_INCLUDE_ANALYSIS.value, self.AnalysisModes.DEPENDENTS_REPORT.value}:
             self.file_label.grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
             self.file_entry.grid(row=1, column=1, sticky="ew", pady=4)
             self.file_button.grid(row=1, column=2, padx=(6, 0), pady=4)
@@ -1197,7 +904,7 @@ class IncludeAnalyzerGUI:
     def _get_analyzer(self, project_root: Path) -> IncludeAnalyzer:
         analyzer = self.analyzer_instances.get(project_root)
         if analyzer is None:
-            analyzer = IncludeAnalyzer(project_root)
+            analyzer = IncludeAnalyzer(project_root, self._set_progress)
             self.analyzer_instances[project_root] = analyzer
         return analyzer
 
@@ -1225,12 +932,59 @@ class IncludeAnalyzerGUI:
 
     def clear_output(self) -> None:
         self.output_text.configure(state="normal")
+        self.reports.clear()
         self.output_text.delete("1.0", "end")
         self.output_text.configure(state="disabled")
-        self.last_report = ""
+
+    def _show_report(self, index: int) -> None:
+        if not self.reports:
+            return
+
+        clamped_index = max(0, min(index, len(self.reports) - 1))
+        self.report_index = clamped_index
+
+        self.output_text.configure(state="normal")
+        self.output_text.delete("1.0", "end")
+        self.output_text.insert("1.0", self.reports[self.report_index])
+        self.output_text.configure(state="disabled")
+        self._update_report_nav_state()
+
+    def _update_report_nav_state(self) -> None:
+        has_reports = len(self.reports) > 0
+
+        if not has_reports:
+            self.prev_report_button.state(["disabled"])
+            self.next_report_button.state(["disabled"])
+            self.copy_report_button.state(["disabled"])
+            return
+
+        self.copy_report_button.state(["!disabled"])
+        if self.report_index <= 0:
+            self.prev_report_button.state(["disabled"])
+        else:
+            self.prev_report_button.state(["!disabled"])
+
+        if self.report_index >= len(self.reports) - 1:
+            self.next_report_button.state(["disabled"])
+        else:
+            self.next_report_button.state(["!disabled"])
+
+    def show_previous_report(self) -> None:
+        if not self.reports:
+            return
+        self._show_report(self.report_index - 1)
+
+    def show_next_report(self) -> None:
+        if not self.reports:
+            return
+        self._show_report(self.report_index + 1)
 
     def copy_report(self) -> None:
-        report_text = self.last_report.strip()
+        if not self.reports:
+            messagebox.showwarning("No report", "Run an analysis first before copying.")
+            return
+
+        report_text = self.reports[self.report_index].strip()
         if not report_text:
             messagebox.showwarning("No report", "Run an analysis first before copying.")
             return
@@ -1252,71 +1006,45 @@ class IncludeAnalyzerGUI:
             raise ValueError("Please choose a valid input/target file.")
         return file_path.resolve()
 
-    @staticmethod
-    def _require_positive_int(value_text: str, field_name: str) -> int:
-        try:
-            parsed = int(value_text)
-        except ValueError as exc:
-            raise ValueError(f"{field_name} must be a positive integer.") from exc
-
-        if parsed <= 0:
-            raise ValueError(f"{field_name} must be a positive integer.")
-
-        return parsed
-
     def run_analysis(self) -> None:
         self.run_button.state(["disabled"])
+        analyzer: Optional[IncludeAnalyzer] = None
         try:
-            self._set_progress("Starting analysis...", 0)
-            project_root = self._require_project_root()
-            analyzer = self._get_analyzer(project_root)
-            mode = self.analysis_mode_var.get()
-            workers = self._require_positive_int(self.worker_count_var.get().strip(), "Threads")
+            self._set_progress(IncludeAnalyzer.ProgressMessages.INIT.value, IncludeAnalyzer.ProgressValues.INIT_START.value)
+            analyzer = self._get_analyzer(self._require_project_root())
+            analyzer.workers = max(1, self.worker_count_var.get())
+            analyzer.build_project_file_include_data()
 
-            if mode == "File include analysis":
-                file_path = self._require_file()
-                report = analyzer.report_file_include_analysis(
-                    file_path,
-                    workers=workers,
-                    progress_cb=self._set_progress,
-                )
-            elif mode == "Project totals":
-                include_header_ranking = self.include_header_ranking_var.get()
-                top_n = 50
-                if include_header_ranking:
-                    top_n = self._require_positive_int(self.top_n_var.get().strip(), "Top N")
+            match self.analysis_mode_var.get():
+                case self.AnalysisModes.FILE_INCLUDE_ANALYSIS.value:
+                    file_path = self._require_file()
+                    report = analyzer.report_file_include_analysis(file_path)
 
-                report = analyzer.report_project_totals(
-                    headers_only=self.headers_only_var.get(),
-                    include_project_include_sum=self.include_project_include_sum_var.get(),
-                    include_project_include_sum_cpp_only=self.include_project_include_sum_cpp_only_var.get(),
-                    include_header_ranking=include_header_ranking,
-                    top_n=top_n,
-                    header_ranking_count_transitive=self.header_ranking_count_transitive_var.get(),
-                    header_ranking_sort_by=self.header_ranking_sort_var.get(),
-                    workers=workers,
-                    progress_cb=self._set_progress,
-                )
-            elif mode == "Dependents report":
-                file_path = self._require_file()
-                report = analyzer.report_dependents(
-                    file_path,
-                    include_breakdown=self.include_breakdown_var.get(),
-                    include_dependents_include_sum=self.include_dependents_include_sum_var.get(),
-                    include_dependents_include_sum_cpp_only=self.include_dependents_include_sum_cpp_only_var.get(),
-                    hide_cpp_in_breakdown=self.hide_cpp_in_breakdown_var.get(),
-                    show_detail=self.show_detail_var.get(),
-                    workers=workers,
-                    progress_cb=self._set_progress,
-                )
-            else:
-                raise ValueError("Unsupported analysis mode selected.")
+                case self.AnalysisModes.PROJECT_TOTALS.value:
+                    report = analyzer.report_project_totals(
+                        include_project_include_sum=self.include_project_include_sum_var.get(),
+                        include_sum_cpp_only=self.include_project_include_sum_cpp_only_var.get(),
+                        include_header_ranking=self.include_header_ranking_var.get(),
+                        top_n=min(self.top_n_var.get(), 0),
+                        header_ranking_count_transitive=self.header_ranking_count_transitive_var.get(),
+                        header_ranking_sort_by=self.header_ranking_sort_str.get()
+                    )
 
-            self.last_report = report
-            self.output_text.configure(state="normal")
-            self.output_text.delete("1.0", "end")
-            self.output_text.insert("1.0", report)
-            self.output_text.configure(state="disabled")
+                case self.AnalysisModes.DEPENDENTS_REPORT.value:
+                    file_path = self._require_file()
+                    report = analyzer.report_dependents(
+                        file_path,
+                        include_breakdown=self.include_breakdown_var.get(),
+                        include_dependents_include_sum=self.include_dependents_include_sum_var.get(),
+                        include_sum_cpp_only=self.include_dependents_include_sum_cpp_only_var.get(),
+                        hide_cpp_in_breakdown=self.hide_cpp_in_breakdown_var.get()
+                    )
+
+                case _:
+                    raise ValueError("Unsupported analysis mode selected.")
+
+            self.reports.append(report)
+            self._show_report(len(self.reports) - 1)
             self._set_progress("Done", 100)
 
         except Exception as exc:
@@ -1326,13 +1054,13 @@ class IncludeAnalyzerGUI:
             self.output_text.delete("1.0", "end")
             self.output_text.insert("1.0", error_message)
             self.output_text.configure(state="disabled")
-            self.last_report = ""
             self._set_progress("Failed", 0)
+            self._update_report_nav_state()
         finally:
             self.run_button.state(["!disabled"])
 
     def save_report(self) -> None:
-        if not self.last_report:
+        if len(self.reports) == 0:
             messagebox.showwarning("No report", "Run an analysis first before saving.")
             return
 
@@ -1348,15 +1076,13 @@ class IncludeAnalyzerGUI:
             return
 
         with open(save_path, "w", encoding="utf-8") as file_handle:
-            file_handle.write(self.last_report)
+            file_handle.write(self.reports[self.report_index])
 
         messagebox.showinfo("Saved", f"Report saved to:\n{save_path}")
 
 
 def main() -> None:
-    root = Tk()
-    app = IncludeAnalyzerGUI(root)
-    root.mainloop()
+    app = IncludeAnalyzerGUI()
 
 
 if __name__ == "__main__":

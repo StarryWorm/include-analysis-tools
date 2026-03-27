@@ -35,7 +35,7 @@ python include_analyzer.py
 - **Threads** is available for all modes (default `cpu_count - 4`, minimum `1`).
 - **Reuse cache between runs** is available for all modes (enabled by default) to speed up repeated analyses in the same project.
 - In **Project totals**, the optional header ranking additionally supports:
-	- **Add sum of each file's unique transitive includes** (project-wide include "cost" by summing each analyzed file's own unique transitive include count)
+	- **Add sum of each file's unique includes** (project-wide include "cost" by summing each analyzed file's own unique include count)
 	- **Only count `.cpp` files for include sum** (default `on`; limits the above sum to translation units)
 	- **Top N** (default `50`)
 	- **Count transitive includes** (default `on`; when on, ranks headers by total transitive includers like Dependents mode, and when off ranks by direct includers only)
@@ -48,4 +48,4 @@ python include_analyzer.py
 
 ## AI Disclosure
 
-This is completely vibe-coded, but it works so that's that.
+This was initially completely vibe-coded, now only the GUI is. The rest has been refined by yours truly after being annoyed too much by slight inconsistencies.
