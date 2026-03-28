@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import traceback
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, DoubleVar, IntVar, StringVar, Tk, filedialog, messagebox
@@ -331,14 +331,23 @@ class IncludeAnalyzer:
 
         all_includes: Set[Path] = start_data.direct_includes | start_data.transitive_includes
         include_paths: Dict[Path, List[List[Path]]] = {path: [] for path in all_includes}
-        to_visit: List[tuple[Path, List[Path]]] = [(start_file, [start_file])]
+        include_path_signatures: Dict[Path, Set[tuple[Path, ...]]] = {path: set() for path in all_includes}
+        to_visit = deque([(start_file, [start_file])])
+        queued_nodes: Set[Path] = {start_file}
+        expanded_nodes: Set[Path] = set()
         visited_for_progress: Set[Path] = set()
         visit_budget = len(file_data_map) + 1
         bfs_progress_start = self.ProgressValues.COMPUTING_REPORT_VALUES.value
         bfs_progress_span = self.ProgressValues.COMPUTED_REPORT_VALUES.value - self.ProgressValues.COMPUTING_REPORT_VALUES.value
 
         while to_visit:
-            current_file, current_chain = to_visit.pop()
+            current_file, current_chain = to_visit.popleft()
+            queued_nodes.discard(current_file)
+
+            if current_file in expanded_nodes:
+                continue
+            expanded_nodes.add(current_file)
+
             if current_file not in visited_for_progress:
                 visited_for_progress.add(current_file)
                 bfs_progress = bfs_progress_start + bfs_progress_span * (min(len(visited_for_progress), visit_budget) / visit_budget)
@@ -349,12 +358,17 @@ class IncludeAnalyzer:
                     continue
 
                 new_chain = current_chain + [resolved_path]
-                if new_chain not in include_paths[resolved_path]:
+                chain_signature = tuple(new_chain)
+                if chain_signature not in include_path_signatures[resolved_path]:
+                    include_path_signatures[resolved_path].add(chain_signature)
                     include_paths[resolved_path].append(new_chain)
 
                 if resolved_path in current_chain:
                     continue
-                to_visit.append((resolved_path, new_chain))
+
+                if resolved_path not in expanded_nodes and resolved_path not in queued_nodes:
+                    to_visit.append((resolved_path, new_chain))
+                    queued_nodes.add(resolved_path)
 
         self._emit_progress(self.ProgressMessages.FORMATTING_OUTPUT.value, self.ProgressValues.FORMATTING_OUTPUT.value)
         included_split = self._split_cpp_h_counts(all_includes)
